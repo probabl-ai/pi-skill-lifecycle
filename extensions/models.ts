@@ -17,6 +17,23 @@ export const THINKING_LEVELS: readonly ThinkingLevel[] = ["off", "minimal", "low
 
 export type TierScope = "session" | "run";
 
+/**
+ * What a `metadata.role: helper` skill does to the model while the skill that
+ * loaded it keeps working:
+ *
+ * - "keep": leave the caller's model alone (the behavior before 0.4).
+ * - "allow-downgrade" (default): apply the helper's tier only when it is
+ *   strictly cheaper than the model now in use, so a small or medium sub-step
+ *   does not run on a big caller's model. Never upgrades.
+ * - "always": apply the helper's tier, upgrades included.
+ *
+ * A helper switch lasts for the rest of the run only: the caller keeps working
+ * after the helper, so its model comes back when the run settles.
+ */
+export type HelperTierPolicy = "keep" | "allow-downgrade" | "always";
+
+export const HELPER_TIER_POLICIES: readonly HelperTierPolicy[] = ["keep", "allow-downgrade", "always"];
+
 /** One tier: the Pi model to switch to, and how the switch behaves. */
 export interface ModelTier {
   /** Provider id in Pi's model registry, e.g. "openrouter". */
@@ -61,6 +78,11 @@ export interface ModelConfig {
    * back to `default` for one that names a tier that is not defined.
    */
   applyToUnlabeledSkills?: boolean;
+  /**
+   * What a helper loaded by a working caller does to the model: "keep",
+   * "allow-downgrade", or "always". Default: "allow-downgrade".
+   */
+  helperTierPolicy?: HelperTierPolicy;
 }
 
 /** A normalized ModelConfig, with every field defined. */
@@ -70,6 +92,7 @@ export interface ModelSettings {
   default: ModelTierRef | null;
   skillTiers: Record<string, string>;
   applyToUnlabeledSkills: boolean;
+  helperTierPolicy: HelperTierPolicy;
 }
 
 // ── Defaults ──────────────────────────────────────────────────────
@@ -81,6 +104,7 @@ export const DEFAULT_MODEL_CONFIG: ModelSettings = {
   default: null,
   skillTiers: {},
   applyToUnlabeledSkills: true,
+  helperTierPolicy: "allow-downgrade",
 };
 
 /** Tier names that deliberately keep the current model. */
@@ -106,6 +130,12 @@ export function normalizeTier(value: unknown): ModelTier | undefined {
   if (isThinkingLevel(raw.thinkingLevel)) tier.thinkingLevel = raw.thinkingLevel;
   if (raw.scope === "session" || raw.scope === "run") tier.scope = raw.scope;
   return tier;
+}
+
+function normalizeHelperPolicy(value: unknown): HelperTierPolicy | undefined {
+  if (typeof value !== "string") return undefined;
+  const policy = value.trim().toLowerCase();
+  return (HELPER_TIER_POLICIES as readonly string[]).includes(policy) ? (policy as HelperTierPolicy) : undefined;
 }
 
 function normalizeRef(value: unknown): ModelTierRef | null | undefined {
@@ -140,7 +170,69 @@ export function modelSettingsFrom(partial?: ModelConfig | ModelSettings | null):
       typeof raw.applyToUnlabeledSkills === "boolean"
         ? raw.applyToUnlabeledSkills
         : DEFAULT_MODEL_CONFIG.applyToUnlabeledSkills,
+    helperTierPolicy: normalizeHelperPolicy(raw.helperTierPolicy) ?? DEFAULT_MODEL_CONFIG.helperTierPolicy,
   };
+}
+
+// ── Price comparison ──────────────────────────────────────────────
+
+/** The part of a Pi model that the price comparison reads. */
+export interface PricedModel {
+  provider: string;
+  id: string;
+  cost?: { input?: number; output?: number };
+}
+
+/**
+ * Price used to rank models: input plus output price per million tokens, as
+ * listed in Pi's model registry. Undefined when either price is missing or
+ * invalid, so an unpriced model never counts as cheaper.
+ */
+export function modelPrice(model: PricedModel | undefined): number | undefined {
+  const input = model?.cost?.input;
+  const output = model?.cost?.output;
+  const valid = (n: unknown): n is number => typeof n === "number" && Number.isFinite(n) && n >= 0;
+  return valid(input) && valid(output) ? input + output : undefined;
+}
+
+const levelRank = (level: string | undefined) =>
+  level === undefined ? -1 : (THINKING_LEVELS as readonly string[]).indexOf(level);
+
+/** How a tier's model compares with the model in use: "unknown" when it cannot be told. */
+export type CostComparison = "cheaper" | "not-cheaper" | "unknown";
+
+/**
+ * Compare moving from the current model to a tier's model. It is cheaper when
+ * the other model has a lower price, or when it is the same model at a lower
+ * thinking level. A missing price or thinking level gives "unknown".
+ */
+export function compareModelCost(
+  current: PricedModel | undefined,
+  currentLevel: string | undefined,
+  target: PricedModel | undefined,
+  targetLevel: string | undefined,
+): CostComparison {
+  if (!current || !target) return "unknown";
+  if (current.provider === target.provider && current.id === target.id) {
+    const from = levelRank(currentLevel);
+    const to = levelRank(targetLevel);
+    if (from < 0 || to < 0) return "unknown";
+    return to < from ? "cheaper" : "not-cheaper";
+  }
+  const from = modelPrice(current);
+  const to = modelPrice(target);
+  if (from === undefined || to === undefined) return "unknown";
+  return to < from ? "cheaper" : "not-cheaper";
+}
+
+/** Whether moving to a tier's model is known to be strictly cheaper; unknown is not cheaper. */
+export function isCheaperModel(
+  current: PricedModel | undefined,
+  currentLevel: string | undefined,
+  target: PricedModel | undefined,
+  targetLevel: string | undefined,
+): boolean {
+  return compareModelCost(current, currentLevel, target, targetLevel) === "cheaper";
 }
 
 // ── Tier lookup ───────────────────────────────────────────────────
@@ -262,6 +354,8 @@ export interface ModelEvent {
   tier?: string;
   source?: TierSource;
   scope?: TierScope;
+  /** The switch was made by a helper while its caller keeps working. */
+  helper?: boolean;
 }
 
 /** The chat line for a model change; `expanded` adds where the model came from. */
@@ -269,7 +363,7 @@ export function describeModelEvent(e: ModelEvent, expanded = false): string {
   const model = `${e.to}${e.thinkingLevel ? ` (thinking ${e.thinkingLevel})` : ""}`;
   const why =
     e.event === "switch"
-      ? `tier "${e.tier}" for ${e.trigger}${e.scope === "run" ? ", this run only" : ""}`
+      ? `tier "${e.tier}" for ${e.trigger}${e.helper ? " (helper of a working caller)" : ""}${e.scope === "run" ? ", this run only" : ""}`
       : e.event === "restore"
         ? `restored at the end of the run${e.tier ? ` (tier "${e.tier}" was for that run only)` : ""}`
         : "restored by /skills-model reset";

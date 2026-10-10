@@ -270,7 +270,8 @@ Nothing switches until you define tiers. A starting point on OpenRouter:
     },
     "default": "medium",
     "skillTiers": { "legacy-skill": "big" },
-    "applyToUnlabeledSkills": true
+    "applyToUnlabeledSkills": true,
+    "helperTierPolicy": "allow-downgrade"
   }
 }
 ```
@@ -282,6 +283,7 @@ Nothing switches until you define tiers. A starting point on OpenRouter:
 | `models.default` | `null` | Model (or tier name) used when a skill declares no tier, and when it names a tier that is not defined. `null` leaves the current model |
 | `models.skillTiers` | `{}` | Per-skill tier overrides, so you can tier a skill you do not want to edit |
 | `models.applyToUnlabeledSkills` | `true` | Apply `default` to skills that declare no tier. `false` still falls back to `default` for an unknown tier name |
+| `models.helperTierPolicy` | `"allow-downgrade"` | What a helper loaded by a working caller does: `"allow-downgrade"` (switch only to a model cheaper than the caller's), `"keep"` (never switch), or `"always"` (apply its tier). A helper's switch lasts for the run |
 
 - **Precedence**: `models.skillTiers` (config) → `metadata.modelTier`
   (frontmatter) → `models.default`.
@@ -297,13 +299,30 @@ Nothing switches until you define tiers. A starting point on OpenRouter:
   before that tier, so an expensive tier is used for the run that asked for it
   only. A session-scoped switch later in the same run, or a model you pick
   yourself (`/model`), supersedes it and is kept.
-- **Helpers keep their caller's model**: a `metadata.role: helper` skill
-  does not switch the model while its caller keeps working afterwards: when
-  another skill (other than the entry skill) is loaded, or a non-helper skill
-  is requested in the same assistant message, in either order. A helper
-  loaded on its own, or with `/skill:name`, applies its tier. The notice
-  `🎚️ skill("plot-ml-figure") keeps … (tier "small" not applied)` says when
-  that happened.
+- **Helpers only switch down while their caller works**: a
+  `metadata.role: helper` skill is loaded *by a working caller* when another
+  skill (other than the entry skill) is loaded, or a non-helper skill is
+  requested in the same assistant message, in either order. Such a load
+  follows `models.helperTierPolicy`:
+  - `allow-downgrade` (default): the helper's tier applies only when it is
+    **cheaper than the caller's model**, so a small or medium sub-step does
+    not run on a big coordinator's model. It never upgrades. Cheaper means a
+    lower `input + output` price in Pi's model registry, or the same model
+    at a lower thinking level; when a price is missing nothing switches.
+    Helpers are compared with the caller's model, not with the model a
+    previous helper left, so a medium helper can follow a small one, and a
+    helper can switch back up to the caller's model, never above it.
+  - `keep`: a helper never switches while its caller works (the behavior
+    before 0.4).
+  - `always`: a helper applies its tier, upgrades included.
+
+  A helper's switch lasts for the rest of the run only, whatever its tier's
+  `scope`: the caller keeps working after the helper, so the caller's model
+  comes back when the run settles. A helper loaded on its own, or with
+  `/skill:name`, applies its tier like any skill. When a helper keeps the
+  caller's model the notice says why, e.g.
+  `🎚️ skill("build-ml-pipeline") keeps … (tier "big" not applied: not
+  cheaper than the caller's …)`.
 - **Parallel loads**: skills loaded by one assistant message switch one at a
   time in call order, so the last one that switches wins.
 - **Failures never block a skill**: a model that is unknown, has no
@@ -312,7 +331,8 @@ Nothing switches until you define tiers. A starting point on OpenRouter:
 - **Explicit commands**: `/skill:name` switches too, before the first request
   of the run. `/skills-model` shows the resolved config and, for each loaded
   skill, its tier, whether it is a helper, and what its latest load did
-  (`switched to …`, `already on …`, `kept … (helper of a working caller)`).
+  (`switched to …`, `already on …`, `kept … (helper of a working caller)`),
+  plus the helper policy in effect.
   `/skills-model reset` goes back to the model from before the first switch.
 
 Every model change the extension makes stays visible in the chat, also after
