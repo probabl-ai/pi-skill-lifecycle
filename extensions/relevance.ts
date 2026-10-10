@@ -132,8 +132,14 @@ export interface SkillIndex {
   docs: Map<string, Doc>;
   idf: Map<string, number>;
   avgLen: number;
-  /** name → names of other skills its body mentions. */
+  /** name → names of other skills its body mentions (used to infer the router). */
   refs: Map<string, Set<string>>;
+  /**
+   * name → names of other skills its body tells the model to load: `refs`
+   * without prohibitions such as "Do not load `x`". Used for caller
+   * relations (`protectCallers`, the dispatcher hint).
+   */
+  calls: Map<string, Set<string>>;
   /** Roles declared in frontmatter (`metadata.role`). */
   declaredRoles: Map<string, SkillRole>;
   /** Entry skill: declared in frontmatter, else inferred from references, else undefined. */
@@ -161,6 +167,21 @@ export function mentionedSkills(body: string, self: string, names: readonly stri
     if (wanted.has(name)) out.add(byLower.get(name)!);
   }
   return out;
+}
+
+/**
+ * A prohibition: a negation governing a load-like verb, then the skill name
+ * (optionally quoted). Whitespace includes newlines, so a sentence wrapped
+ * across lines ("Do not\n   load `build-ml-pipeline`") is still caught. The
+ * negation must sit right before the verb, so a condition such as "if it is
+ * not installed, load `x`" stays a call.
+ */
+const PROHIBITION =
+  /\b(?:do not|don't|never|must not|should not|shouldn't|not to)\s+(?:\w+\s+)?(?:load|call|invoke|use|route to|hand off to)\s+[`'"]?[\w-]+[`'"]?/gi;
+
+/** Skills a body tells the model to load: its mentions, minus prohibitions. */
+export function calledSkills(body: string, self: string, names: readonly string[]): Set<string> {
+  return mentionedSkills(body.replace(PROHIBITION, " "), self, names);
 }
 
 /** `metadata.role` from the frontmatter, if it is a role this extension knows. */
@@ -210,6 +231,7 @@ export function buildSkillIndex(skills: readonly IndexableSkill[]): SkillIndex {
   const docs = new Map<string, Doc>();
   const df = new Map<string, number>();
   const refs = new Map<string, Set<string>>();
+  const calls = new Map<string, Set<string>>();
   const declaredRoles = new Map<string, SkillRole>();
 
   for (const s of skills) {
@@ -221,6 +243,7 @@ export function buildSkillIndex(skills: readonly IndexableSkill[]): SkillIndex {
     docs.set(s.name, { tf, len });
     for (const t of tf.keys()) df.set(t, (df.get(t) ?? 0) + 1);
     refs.set(s.name, s.body ? mentionedSkills(s.body, s.name, names) : new Set());
+    calls.set(s.name, s.body ? calledSkills(s.body, s.name, names) : new Set());
     const role = declaredRole(s.metadata);
     if (role) declaredRoles.set(s.name, role);
   }
@@ -238,7 +261,7 @@ export function buildSkillIndex(skills: readonly IndexableSkill[]): SkillIndex {
       ? { name: inferred, source: "inferred" as const }
       : undefined;
 
-  return { names, docs, idf, avgLen, refs, declaredRoles, entry };
+  return { names, docs, idf, avgLen, refs, calls, declaredRoles, entry };
 }
 
 // ── Scoring ───────────────────────────────────────────────────────

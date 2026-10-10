@@ -294,7 +294,60 @@ describe("selectBodiesSupersededBy", () => {
     expect(names(supersede(["persist-ml-git"], loaded))).toEqual(["build-ml-pipeline", "explore-ml-data"]);
   });
 
+  it("with protectLoader, keeps the body loaded just before the new skill", () => {
+    const loaded = loadedInOrder("explore-ml-data", "persist-ml-git");
+    // explore-ml-data is not relevant to persist-ml-git; only the loader rule keeps it.
+    expect(names(supersede(["persist-ml-git"], loaded, { protectLoader: true }))).toEqual([]);
+    expect(names(supersede(["persist-ml-git"], loaded))).toEqual(["explore-ml-data"]);
+  });
+
+  it("protectLoader keeps only the immediate predecessor", () => {
+    const loaded = loadedInOrder("plot-ml-figure", "explore-ml-data", "persist-ml-git");
+    expect(names(supersede(["persist-ml-git"], loaded, { protectLoader: true }))).toEqual(["plot-ml-figure"]);
+  });
+
+  it("labels an evicted body that dispatched to the new skill", () => {
+    const out = supersede(["persist-ml-git"], loadedInOrder("explore-ml-data", "persist-ml-git"));
+    expect(out[0].reason).toContain("this body calls persist-ml-git");
+    expect(out[0].reason).toContain("metadata.role: helper");
+  });
+
+  it("does not label an unrelated evicted body", () => {
+    // build-ml-pipeline does not mention persist-ml-git.
+    const out = supersede(["persist-ml-git"], loadedInOrder("build-ml-pipeline", "persist-ml-git"));
+    expect(out[0].reason).not.toContain("metadata.role: helper");
+  });
+
   it("returns nothing without a new skill", () => {
     expect(supersede([], loadedInOrder("explore-ml-data"))).toEqual([]);
+  });
+});
+
+// ── Prohibitions are not calls ────────────────────────────────────
+
+describe("selectBodiesSupersededBy with a prohibition", () => {
+  // explore-ml-data now forbids persist-ml-git instead of calling it.
+  const forbidding = buildSkillIndex(
+    PACK.map((s) => (s.name === "explore-ml-data" ? { ...s, body: "# Explore ML Data\n\nDo not load `persist-ml-git` here." } : s)),
+  );
+  const supersede = (opts: object = {}) =>
+    selectBodiesSupersededBy(
+      ["persist-ml-git"],
+      loadedInOrder("explore-ml-data", "persist-ml-git"),
+      forbidding,
+      new Set(),
+      new Set(),
+      configWithDefaults(opts),
+      descriptions,
+    );
+
+  it("does not label the body as a dispatcher", () => {
+    const out = supersede();
+    expect(names(out)).toEqual(["explore-ml-data"]);
+    expect(out[0].reason).not.toContain("metadata.role: helper");
+  });
+
+  it("is not protected by protectCallers", () => {
+    expect(names(supersede({ protectCallers: true }))).toEqual(["explore-ml-data"]);
   });
 });

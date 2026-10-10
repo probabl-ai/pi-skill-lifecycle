@@ -9,6 +9,7 @@
  */
 
 import { decideRelevance, tokenize, type RelevanceOptions, type SkillIndex } from "./relevance.ts";
+import { DEFAULT_MODEL_CONFIG, type ModelConfig } from "./models.ts";
 
 export { tokenize } from "./relevance.ts";
 
@@ -48,10 +49,18 @@ export interface EngineConfig {
   /** Best score below this means the prompt carries no topic signal: nothing is evicted. Default: 2 */
   minSignal?: number;
   /**
-   * When a skill is loaded mid-run, keep loaded bodies whose skill mentions
-   * it by name (the caller of a sub-step). Default: false
+   * When a skill is loaded mid-run, keep bodies whose skill tells the model
+   * to load a new skill (the caller of a sub-step); a "Do not load" mention
+   * is not a call. Default: false
    */
   protectCallers?: boolean;
+  /**
+   * When a skill is loaded mid-run, keep the body that was loaded immediately
+   * before it: in a dispatch chain that body is usually the caller still being
+   * worked from. Measured to cut reloads, not to prevent wrong evictions —
+   * declaring `metadata.role: helper` is the precise fix. Default: false
+   */
+  protectLoader?: boolean;
   /** Infer the entry skill from the skills when neither the config nor a frontmatter declares one. Default: true */
   inferEntrySkill?: boolean;
 
@@ -84,8 +93,21 @@ export interface EngineConfig {
   evictOnSkillLoad?: boolean;
   /** Block `read` calls on a known SKILL.md and point to the skill tool. Default: true */
   blockDirectSkillReads?: boolean;
+  /**
+   * Archive irrelevant skill bodies at all. The persisted counterpart of
+   * `/skills-off`; `/skills-reload` re-applies it. Default: true
+   */
+  enabled?: boolean;
   /** Notify when bodies are loaded or archived. Default: true */
   verbose?: boolean;
+
+  // ── Model tiers ──────────────────────────────────────────────
+  /**
+   * Switch models when a skill declares a tier (`metadata.modelTier`). Tiers
+   * map to models already registered in Pi, so no new API key is needed.
+   * See models.ts. Default: no tiers, nothing switches.
+   */
+  models?: ModelConfig;
 
   // ── Change detection ─────────────────────────────────────────
   /** Skip scoring when the prompt is a short follow-up. Default: true */
@@ -103,6 +125,7 @@ export const DEFAULT_CONFIG: Required<EngineConfig> = {
   relativeScore: 0.5,
   minSignal: 2,
   protectCallers: false,
+  protectLoader: false,
   inferEntrySkill: true,
   rules: [],
   threshold: 0.15,
@@ -114,7 +137,9 @@ export const DEFAULT_CONFIG: Required<EngineConfig> = {
   maxKeep: 0,
   evictOnSkillLoad: true,
   blockDirectSkillReads: true,
+  enabled: true,
   verbose: true,
+  models: DEFAULT_MODEL_CONFIG,
   skipOnShortPrompts: true,
   minScorablePromptLength: 15,
   topicChangeThreshold: 0.7,
@@ -314,6 +339,16 @@ export function selectBodiesToEvict(
   return evictUnrelated(prompt, loaded, index, isProtected, config, relevanceOptions(config));
 }
 
+/** The most recently loaded body that is not one of `fresh`, if any. */
+function mostRecentBefore(loaded: readonly LoadedBody[], fresh: ReadonlySet<string>): string | undefined {
+  let best: LoadedBody | undefined;
+  for (const body of loaded) {
+    if (fresh.has(body.name)) continue;
+    if (!best || body.seq > best.seq) best = body;
+  }
+  return best?.name;
+}
+
 /**
  * Bodies made obsolete by skills loaded in the middle of a run.
  *
@@ -323,10 +358,15 @@ export function selectBodiesToEvict(
  * - Loading only helpers (`roles.helpers`) evicts nothing: the calling skill
  *   keeps its instructions. Otherwise only non-helpers are judged against.
  * - The new skills and pinned bodies are kept; with `protectCallers`, so are
- *   bodies whose skill mentions a new skill by name.
+ *   bodies whose skill tells the model to load a new skill (a "Do not load"
+ *   mention is not a call); with `protectLoader`, so is the body loaded just
+ *   before the new one.
  * - `minKeep` does not apply: the new skill is the one being worked on.
  * - There is no abstaining: when no other skill shares terms with the new
  *   one, every unprotected body is unrelated.
+ * - An evicted body that dispatched to the new skill is labelled as such: 52%
+ *   of mid-run evictions in the measured pack are of that kind, and the label
+ *   points the pack author at `metadata.role: helper`.
  */
 export function selectBodiesSupersededBy(
   newNames: readonly string[],
@@ -341,15 +381,19 @@ export function selectBodiesSupersededBy(
   const owners = [...fresh].filter((name) => !helpers.has(name));
   if (owners.length === 0) return [];
   const callers = (name: string) =>
-    config.protectCallers && owners.some((owner) => index.refs.get(name)?.has(owner));
-  const isProtected = (name: string) => pinnedSet.has(name) || fresh.has(name) || callers(name);
+    config.protectCallers && owners.some((owner) => index.calls.get(name)?.has(owner));
+  const loader = config.protectLoader ? mostRecentBefore(loaded, fresh) : undefined;
+  const isProtected = (name: string) =>
+    pinnedSet.has(name) || fresh.has(name) || name === loader || callers(name);
   const text = owners.map((name) => `${name.replace(/-/g, " ")} ${descriptions.get(name) ?? ""}`).join("\n");
   // The new skill is the topic signal, so never abstain here.
   const options = { ...relevanceOptions(config), minSignal: 0 };
-  return evictUnrelated(text, loaded, index, isProtected, config, options, fresh).map((b) => ({
-    ...b,
-    reason: b.reason.startsWith("over maxKeep") || b.reason === "skill no longer installed"
-      ? b.reason
-      : `superseded by ${owners.join(", ")} (${b.reason})`,
-  }));
+  return evictUnrelated(text, loaded, index, isProtected, config, options, fresh).map((b) => {
+    if (b.reason.startsWith("over maxKeep") || b.reason === "skill no longer installed") return b;
+    const dispatchers = owners.filter((owner) => index.calls.get(b.name)?.has(owner));
+    const hint = dispatchers.length > 0
+      ? `; this body calls ${dispatchers.join(", ")} — declare metadata.role: helper to keep it`
+      : "";
+    return { ...b, reason: `superseded by ${owners.join(", ")} (${b.reason})${hint}` };
+  });
 }

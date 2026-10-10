@@ -16,9 +16,12 @@
  *   descriptions, body excerpts, and cross-references), so no keyword list
  *   is needed. The entry skill and helper skills come from the frontmatter
  *   (`metadata.role`), the config, or inference.
+ * - A skill can name a model tier (`metadata.modelTier`); the `models` config
+ *   maps tiers to models already registered in Pi, and the extension switches
+ *   with `pi.setModel()` — no new provider or API key is ever needed.
  *
  * Commands: /skills-pin, /skills-unpin, /skills-list, /skills-explain,
- *           /skills-reload, /skills-on, /skills-off
+ *           /skills-reload, /skills-on, /skills-off, /skills-model
  */
 
 import { readdir, readFile, stat } from "node:fs/promises";
@@ -26,9 +29,18 @@ import { homedir } from "node:os";
 import path from "node:path";
 import { CONFIG_DIR_NAME, getAgentDir, parseFrontmatter } from "@earendil-works/pi-coding-agent";
 import type { ExtensionAPI, ExtensionContext, Skill as PiSkill } from "@earendil-works/pi-coding-agent";
+import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { buildSkillIndex, decideRelevance, type IndexableSkill, type SkillIndex } from "./relevance.ts";
 import type { EngineConfig, Roles } from "./rules.ts";
+import {
+  describeModelEvent,
+  MODEL_EVENT_TYPE,
+  modelSettingsFrom,
+  resolveSkillModel,
+  type ModelEvent,
+  type ModelSettings,
+} from "./models.ts";
 import {
   buildPlaceholder,
   CONFIG_FILENAME,
@@ -102,8 +114,27 @@ export function renderSkillsSection(skills: PiSkill[], entrySkill: string | unde
   ].join("\n");
 }
 
+/** Frontmatter `metadata` as a plain object, or undefined when it is not one. */
+function asMetadata(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : undefined;
+}
+
+/**
+ * Strip a leading YAML frontmatter block. Regex-based on purpose: the skill
+ * tool must return the body of any SKILL.md, even one whose frontmatter is not
+ * valid YAML (Pi reports those separately).
+ */
 function stripFrontmatter(markdown: string): string {
   return markdown.replace(/^\uFEFF?---\r?\n[\s\S]*?\r?\n---[ \t]*(?:\r?\n|$)/, "");
+}
+
+/** Frontmatter `metadata` of a SKILL.md, or undefined when it is missing or invalid YAML. */
+function parseMetadata(markdown: string): Record<string, unknown> | undefined {
+  try {
+    return asMetadata(parseFrontmatter<Record<string, unknown>>(markdown).frontmatter.metadata);
+  } catch {
+    return undefined;
+  }
 }
 
 // ── Message helpers ───────────────────────────────────────────────
@@ -127,15 +158,23 @@ interface ParsedSkillFile {
 async function parseSkillFile(filePath: string, mtimeMs: number): Promise<ParsedSkillFile> {
   try {
     const { frontmatter, body } = parseFrontmatter<Record<string, unknown>>(await readFile(filePath, "utf-8"));
-    const metadata = frontmatter.metadata;
-    return {
-      mtimeMs,
-      body,
-      metadata: metadata && typeof metadata === "object" && !Array.isArray(metadata) ? (metadata as Record<string, unknown>) : undefined,
-    };
+    return { mtimeMs, body, metadata: asMetadata(frontmatter.metadata) };
   } catch {
     return { mtimeMs, body: "" };
   }
+}
+
+// ── Model tiers ───────────────────────────────────────────────────
+
+/** Model and thinking level captured before a switch, so it can be restored. */
+interface ModelSnapshot {
+  provider: string;
+  id: string;
+  thinkingLevel?: Parameters<ExtensionAPI["setThinkingLevel"]>[0];
+}
+
+function describeModel(model: { provider: string; id: string } | undefined): string {
+  return model ? `${model.provider}/${model.id}` : "none";
 }
 
 // ── Extension ─────────────────────────────────────────────────────
@@ -159,6 +198,31 @@ export default function (pi: ExtensionAPI) {
   /** Config files that were read, for /skills-list. */
   let configSources: string[] = [];
   let prevFingerprint: ReturnType<typeof fingerprintPrompt> | undefined;
+  /** Normalized `models` config; recomputed on every config reload. */
+  let modelSettings: ModelSettings = modelSettingsFrom();
+  /** Model active before the first skill-driven switch, for /skills-model reset. */
+  let modelSnapshot: ModelSnapshot | undefined;
+  /**
+   * Model active just before the run-scoped tier now in effect; undefined when
+   * none is. Restored and cleared when the run settles.
+   */
+  let runSnapshot: ModelSnapshot | undefined;
+  /** Name of the run-scoped tier now in effect, for the chat record of its restore. */
+  let runTier: string | undefined;
+  /** Tail of the model-switch queue: switches apply one at a time, in call order. */
+  let modelQueue: Promise<void> = Promise.resolve();
+  /** Model-tier warnings already shown this session (a misconfiguration repeats on every load). */
+  const modelWarnings = new Set<string>();
+  /** True while this extension's own `setModel` runs, to tell it apart from `/model`. */
+  let ownModelSwitch = false;
+  /**
+   * Skills requested by the current assistant message. Pi prepares every tool
+   * call of a message (firing `tool_call`) before executing any, so each load
+   * sees its siblings, whatever their order. Cleared at turn end.
+   */
+  const batch = new Set<string>();
+  /** What the latest load of each skill did to the model, for /skills-model. */
+  const modelOutcomes = new Map<string, string>();
 
   const entryPin = () => (roles.entry && config.pinEntrySkill ? [roles.entry.name] : []);
   const pinned = () => new Set([...configPins, ...userPins, ...entryPin()]);
@@ -222,6 +286,212 @@ export default function (pi: ExtensionAPI) {
     if (ctx.hasUI) ctx.ui.notify(`skill-lifecycle: ${message}`, "warning");
   }
 
+  function info(ctx: ExtensionContext, message: string) {
+    if (config.verbose && ctx.hasUI) ctx.ui.notify(message, "info");
+  }
+
+  // Model changes stay visible in the chat: Pi records `model_change` entries
+  // but does not draw them, and a notification disappears. The entry is part of
+  // the session (also after resume) and is never sent to the model.
+  pi.registerEntryRenderer<ModelEvent>(MODEL_EVENT_TYPE, (entry, { expanded }, theme) => {
+    if (!entry.data) return undefined;
+    const [first, ...details] = describeModelEvent(entry.data, expanded).split("\n");
+    return new Text([theme.fg("accent", first), ...details.map((line) => theme.fg("dim", line))].join("\n"), 1, 0);
+  });
+
+  /** Record a model change made by this extension on the session (drawn in the chat). */
+  function recordModelEvent(event: ModelEvent) {
+    if (!config.verbose) return;
+    try {
+      pi.appendEntry<ModelEvent>(MODEL_EVENT_TYPE, event);
+    } catch {
+      // Best effort: visibility must never break the switch.
+    }
+  }
+
+  /** Current model and thinking level, to tell whether a restore changed anything. */
+  function modelState(ctx: ExtensionContext): string {
+    return `${describeModel(ctx.model)}\0${pi.getThinkingLevel()}`;
+  }
+
+  // ── Model tiers ────────────────────────────────────────────────
+
+  function snapshot(model: NonNullable<ExtensionContext["model"]>, level: ModelSnapshot["thinkingLevel"]): ModelSnapshot {
+    return { provider: model.provider, id: model.id, thinkingLevel: level };
+  }
+
+  /** Warn once per session: a misconfigured tier would otherwise warn on every load. */
+  function warnOnce(ctx: ExtensionContext, message: string) {
+    if (modelWarnings.has(message)) return;
+    modelWarnings.add(message);
+    warn(ctx, message);
+  }
+
+  /**
+   * Run model switches one at a time, in the order they were requested. Tool
+   * calls of one assistant message run in parallel, and two `setModel` calls
+   * racing would leave whichever finished last. The queue survives failures.
+   */
+  function queueModelSwitch(work: () => Promise<void>): Promise<void> {
+    const run = modelQueue.then(work);
+    modelQueue = run.catch(() => undefined);
+    return run;
+  }
+
+  /**
+   * Whether loading `name` must leave the model alone because the skill that
+   * loaded it keeps working: `role: helper` means the caller continues after
+   * the helper, so the helper's tier must not downgrade (or upgrade) the
+   * caller's model for the rest of its work. A helper loaded with nothing but
+   * the entry skill around is the task itself and applies its own tier.
+   */
+  function loadedByWorkingCaller(name: string): boolean {
+    if (!roles.helpers.has(name)) return false;
+    const entry = roles.entry?.name;
+    const isCaller = (other: string) => other !== name && other !== entry;
+    // Any loaded body may be the caller (a helper can call a helper); a skill
+    // requested in the same message counts unless it is itself a helper, since
+    // sibling helpers loaded together do not call each other.
+    return (
+      [...loaded.keys()].some(isCaller) ||
+      [...batch].some((other) => isCaller(other) && !roles.helpers.has(other))
+    );
+  }
+
+  /** A helper kept its caller's model: say so when its own tier would have switched. */
+  function noteKeptModel(name: string, metadata: Record<string, unknown> | undefined, ctx: ExtensionContext) {
+    if (!modelSettings.enabled) return;
+    const decision = resolveSkillModel(name, metadata, modelSettings);
+    const target = decision.ref && ctx.modelRegistry.find(decision.ref.provider, decision.ref.model);
+    const current = describeModel(ctx.model);
+    modelOutcomes.set(name, `kept ${current} (helper of a working caller)`);
+    if (decision.action !== "switch" || !target || describeModel(target) === current) return;
+    modelOutcomes.set(name, `kept ${current} (helper of a working caller; tier "${decision.tier}" not applied)`);
+    info(ctx, `🎚️ skill("${name}") keeps ${current}: helper loaded by a working caller (tier "${decision.tier}" not applied)`);
+  }
+
+  /** `pi.setModel`, marked as ours so the `model_select` it emits is not taken for the user's choice. */
+  async function setOwnModel(model: Parameters<ExtensionAPI["setModel"]>[0]): Promise<boolean> {
+    ownModelSwitch = true;
+    try {
+      return await pi.setModel(model);
+    } finally {
+      ownModelSwitch = false;
+    }
+  }
+
+  /** Put back a model captured before a switch. Returns false when that is not possible. */
+  async function restoreModel(target: ModelSnapshot | undefined, ctx: ExtensionContext): Promise<boolean> {
+    if (!target) return false;
+    const model = ctx.modelRegistry.find(target.provider, target.id);
+    if (!model) return false;
+    try {
+      if (ctx.model?.provider !== model.provider || ctx.model?.id !== model.id) {
+        if (!(await setOwnModel(model))) return false;
+      }
+    } catch {
+      return false;
+    }
+    if (target.thinkingLevel && pi.getThinkingLevel() !== target.thinkingLevel) {
+      pi.setThinkingLevel(target.thinkingLevel);
+    }
+    return true;
+  }
+
+  /**
+   * Switch to the model a skill asks for. The model must already be in Pi's
+   * registry with credentials (a tier only names an existing model), so the
+   * extension never touches providers, API keys, or request headers: on a
+   * missing, unauthenticated, or failing model it keeps the current one and
+   * says why. Never throws, so a failed switch never fails the skill load.
+   */
+  async function applySkillModel(
+    name: string,
+    metadata: Record<string, unknown> | undefined,
+    ctx: ExtensionContext,
+    trigger: string,
+  ): Promise<void> {
+    if (!modelSettings.enabled) return;
+
+    const decision = resolveSkillModel(name, metadata, modelSettings);
+    if (decision.action !== "switch") {
+      if (decision.problem) warnOnce(ctx, decision.problem);
+      return;
+    }
+
+    const ref = decision.ref!;
+    const model = ctx.modelRegistry.find(ref.provider, ref.model);
+    if (!model) {
+      warnOnce(ctx, `model ${ref.provider}/${ref.model} for tier "${decision.tier}" is not registered in Pi; keeping the current model`);
+      return;
+    }
+
+    const current = ctx.model;
+    const before = current ? snapshot(current, pi.getThinkingLevel()) : undefined;
+    const sameModel = current?.provider === model.provider && current?.id === model.id;
+    if (!sameModel) {
+      try {
+        if (!(await setOwnModel(model))) {
+          warnOnce(ctx, `no credentials for ${describeModel(model)} (tier "${decision.tier}"); keeping ${describeModel(current)}`);
+          return;
+        }
+      } catch (err: any) {
+        warnOnce(
+          ctx,
+          `could not switch to ${describeModel(model)} (tier "${decision.tier}"): ${err?.message ?? err}; keeping ${describeModel(current)}`,
+        );
+        return;
+      }
+    }
+    // Pi re-applies its own default thinking level on a model switch, so compare
+    // with the level in effect now, not with the one before the switch.
+    if (ref.thinkingLevel !== undefined && pi.getThinkingLevel() !== ref.thinkingLevel) {
+      pi.setThinkingLevel(ref.thinkingLevel);
+    }
+    // Nothing changed: already on this tier, or the model clamps the level back.
+    if (sameModel && pi.getThinkingLevel() === before?.thinkingLevel) {
+      modelOutcomes.set(name, `already on ${describeModel(model)} (tier "${decision.tier}")`);
+      if (decision.problem) warnOnce(ctx, decision.problem);
+      return;
+    }
+
+    if (before) modelSnapshot ??= before;
+    // A run-scoped tier remembers the model just before it (the first one, if
+    // several run-scoped tiers follow); a session-scoped switch supersedes it.
+    if (ref.scope === "run") {
+      runSnapshot ??= before;
+      runTier = decision.tier;
+    } else {
+      runSnapshot = undefined;
+      runTier = undefined;
+    }
+    modelOutcomes.set(name, `switched to ${describeModel(model)} (tier "${decision.tier}")`);
+    recordModelEvent({
+      event: "switch",
+      from: before && describeModel(before),
+      to: describeModel(model),
+      thinkingLevel: pi.getThinkingLevel(),
+      trigger,
+      tier: decision.tier,
+      source: decision.source,
+      scope: ref.scope ?? "session",
+    });
+    info(
+      ctx,
+      `🎚️ ${trigger} → ${describeModel(model)} (tier "${decision.tier}", ${decision.source ?? "config"})${ref.scope === "run" ? " for this run" : ""}`,
+    );
+    if (decision.problem) warnOnce(ctx, decision.problem);
+  }
+
+  /** Read a SKILL.md for its frontmatter only, for skills loaded outside the skill tool. */
+  async function skillMetadata(skill: PiSkill): Promise<Record<string, unknown> | undefined> {
+    try {
+      return parseMetadata(await readFile(skill.filePath, "utf-8"));
+    } catch {
+      return undefined;
+    }
+  }
+
   /** Merge the user and project config files; project keys override user keys. */
   async function reloadConfig(ctx: ExtensionContext): Promise<void> {
     const paths = configPaths(ctx.cwd);
@@ -234,6 +504,8 @@ export default function (pi: ExtensionAPI) {
     }
     configSources = [user && paths.user, project && paths.project].filter((p): p is string => !!p);
     config = configWithDefaults({ ...user, ...project });
+    modelSettings = modelSettingsFrom(config.models);
+    enabled = config.enabled;
     configPins = new Set(config.pinned.map((name) => name.toLowerCase()));
     roles = resolveRoles(index, config);
   }
@@ -259,6 +531,12 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_start", async (_event, ctx) => {
     await reloadConfig(ctx);
     prevFingerprint = undefined;
+    modelSnapshot = undefined;
+    runSnapshot = undefined;
+    runTier = undefined;
+    modelWarnings.clear();
+    modelOutcomes.clear();
+    batch.clear();
     rebuildFromBranch(ctx);
   });
 
@@ -270,6 +548,20 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("before_agent_start", async (event, ctx) => {
     skillsByName = new Map(event.systemPromptOptions.skills.map((s) => [s.name, s]));
+    batch.clear();
+
+    // A `/skill:name` command is expanded by Pi into a `<skill name="…">` block
+    // in the prompt. Switch the model before the first request of the run; this
+    // also covers command-only skills, which the skill tool refuses to load.
+    const invoked =
+      /^\/skill:([A-Za-z0-9._-]+)/.exec(event.prompt.trim())?.[1] ?? /<skill name="([^"]+)"/.exec(event.prompt)?.[1];
+    const invokedSkill = invoked ? skillsByName.get(invoked) : undefined;
+    if (invokedSkill) {
+      // An explicit command is the user's choice: it applies the skill's tier
+      // even when it is a helper.
+      const metadata = await skillMetadata(invokedSkill);
+      await queueModelSwitch(() => applySkillModel(invokedSkill.name, metadata, ctx, `/skill:${invokedSkill.name}`));
+    }
 
     // Without the skill tool, keep Pi's default listing (which tells the model to use read).
     if (!skillToolActive()) return;
@@ -294,9 +586,18 @@ export default function (pi: ExtensionAPI) {
 
   function evict(evicted: Array<{ name: string; reason: string }>, ctx: ExtensionContext) {
     for (const body of evicted) loaded.delete(body.name);
-    if (config.verbose && evicted.length > 0 && ctx.hasUI) {
+    if (!config.verbose || evicted.length === 0) return;
+    if (ctx.hasUI) {
       const lines = evicted.map((b) => `  ${b.name} — ${b.reason}`);
       ctx.ui.notify(`🧹 Archived skill bodies: ${evicted.map((b) => b.name).join(", ")}\n${lines.join("\n")}`, "info");
+    }
+    // A headless run (print, JSON, replay) has no UI to notify, which used to
+    // make the loss invisible. Record the decision on the session instead; the
+    // entry is not sent to the model.
+    try {
+      pi.appendEntry("skill-lifecycle", { event: "archived", archived: evicted });
+    } catch {
+      // Best effort: visibility must never break the turn.
     }
   }
 
@@ -310,6 +611,7 @@ export default function (pi: ExtensionAPI) {
    * assistant message can run in parallel and load several skills together.
    */
   pi.on("turn_end", (event, ctx) => {
+    batch.clear(); // this message's tool calls are all done
     if (!enabled || !config.evictOnSkillLoad) return;
     const fresh = [...new Set((event.toolResults ?? []).map(skillResultName).filter((n): n is string => !!n))];
     if (fresh.length === 0 || loaded.size <= fresh.length) return;
@@ -351,6 +653,11 @@ export default function (pi: ExtensionAPI) {
 
   /** Route direct SKILL.md reads through the skill tool. Reads of referenced files stay allowed. */
   pi.on("tool_call", (event, ctx) => {
+    if (event.toolName === SKILL_TOOL) {
+      const requested = (event.input as { name?: unknown }).name;
+      if (typeof requested === "string") batch.add(requested);
+      return;
+    }
     if (!config.blockDirectSkillReads || event.toolName !== "read" || !skillToolActive()) return;
     const requested = (event.input as { path?: unknown }).path;
     if (typeof requested !== "string") return;
@@ -364,6 +671,42 @@ export default function (pi: ExtensionAPI) {
         reason: `Load this skill with the ${SKILL_TOOL} tool instead: ${SKILL_TOOL}("${skill.name}")`,
       };
     }
+  });
+
+  /**
+   * A run-scoped tier still in effect goes back to the model active just
+   * before it, so an expensive tier is not silently kept for the whole
+   * session. Cleared on every settle, so it never leaks into the next run.
+   * `agent_settled` is Pi's final boundary: nothing continues after it.
+   */
+  /**
+   * A model picked by the user (`/model`, cycling) or another extension ends a
+   * run-scoped tier: the restore must not override an explicit choice. Pi
+   * reports `/model` with source "set" like our own switches, hence the flag.
+   */
+  pi.on("model_select", (event) => {
+    if (!ownModelSwitch && event.source !== "restore") {
+      runSnapshot = undefined;
+      runTier = undefined;
+    }
+  });
+
+  pi.on("agent_settled", async (_event, ctx) => {
+    const target = runSnapshot;
+    const tier = runTier;
+    runSnapshot = undefined;
+    runTier = undefined;
+    if (!target) return;
+    await queueModelSwitch(async () => {
+      const from = describeModel(ctx.model);
+      const before = modelState(ctx);
+      if (!(await restoreModel(target, ctx))) {
+        warnOnce(ctx, `could not restore ${target.provider}/${target.id} after a run-scoped tier`);
+        return;
+      }
+      if (modelState(ctx) === before) return;
+      recordModelEvent({ event: "restore", from, to: describeModel(ctx.model), thinkingLevel: pi.getThinkingLevel(), tier });
+    });
   });
 
   // ── Skill tool ──────────────────────────────────────────────────
@@ -392,7 +735,24 @@ export default function (pi: ExtensionAPI) {
         throw new Error(`Skill "${skill.name}" can only be invoked by the user with /skill:${skill.name}`);
       }
 
-      const body = stripFrontmatter(await readFile(skill.filePath, "utf-8")).trim();
+      // Reserve the model switch before any await, so skills loaded in parallel
+      // by one assistant message switch in call order, and decide from the
+      // state before this load whether a working caller keeps its model.
+      const file = readFile(skill.filePath, "utf-8");
+      const keepModel = loadedByWorkingCaller(skill.name);
+      const switched = queueModelSwitch(async () => {
+        let text: string;
+        try {
+          text = await file;
+        } catch {
+          return; // the load itself fails and reports it
+        }
+        const metadata = parseMetadata(text);
+        if (keepModel) noteKeptModel(skill.name, metadata, ctx);
+        else await applySkillModel(skill.name, metadata, ctx, `skill("${skill.name}")`);
+      }).catch((err: any) => warn(ctx, `model tier switch failed: ${err?.message ?? err}`));
+      const raw = await file;
+      const body = stripFrontmatter(raw).trim();
       const dir = skill.baseDir || path.dirname(skill.filePath);
       let files: string[] = [];
       try {
@@ -409,6 +769,8 @@ export default function (pi: ExtensionAPI) {
       if (config.verbose && ctx.hasUI) {
         ctx.ui.notify(`📖 Loaded skill: ${skill.name} (${(body.length / 1024).toFixed(1)} KB)`, "info");
       }
+      // The switch must be done before the next request of this run.
+      await switched;
 
       return {
         content: [
@@ -533,6 +895,70 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  pi.registerCommand("skills-model", {
+    description: "Show the model-tier config; /skills-model reset restores the model from before the first switch",
+    handler: async (args, ctx) => {
+      if (args.trim().toLowerCase() === "reset") {
+        if (!modelSnapshot) return ctx.ui.notify("No skill-driven model switch to reset", "warning");
+        const target = modelSnapshot;
+        modelSnapshot = undefined;
+        runSnapshot = undefined;
+        runTier = undefined;
+        let ok = false;
+        await queueModelSwitch(async () => {
+          const from = describeModel(ctx.model);
+          const before = modelState(ctx);
+          ok = await restoreModel(target, ctx);
+          if (ok && modelState(ctx) !== before) {
+            recordModelEvent({ event: "reset", from, to: describeModel(ctx.model), thinkingLevel: pi.getThinkingLevel() });
+          }
+        });
+        return ctx.ui.notify(
+          ok
+            ? `↩︎ Restored ${describeModel(ctx.model)} (the model from before the first skill switch)`
+            : `Could not restore ${target.provider}/${target.id}`,
+          ok ? "info" : "warning",
+        );
+      }
+
+      const lines: string[] = [];
+      lines.push(
+        `Model tiers ${modelSettings.enabled ? "on" : "off"} — current ${describeModel(ctx.model)} (thinking ${pi.getThinkingLevel()})`,
+      );
+      const tierNames = Object.keys(modelSettings.tiers).sort();
+      if (tierNames.length === 0) lines.push("  no tiers configured");
+      for (const name of tierNames) {
+        const tier = modelSettings.tiers[name];
+        const missing = ctx.modelRegistry.find(tier.provider, tier.model) ? "" : " ⚠ not registered";
+        const thinking = tier.thinkingLevel ? ` ${tier.thinkingLevel}` : "";
+        lines.push(`  ${name.padEnd(8)} ${tier.provider}/${tier.model}${thinking} (${tier.scope ?? "session"})${missing}`);
+      }
+      if (modelSettings.default !== null) {
+        const shown =
+          typeof modelSettings.default === "string"
+            ? `tier "${modelSettings.default}"`
+            : `${modelSettings.default.provider}/${modelSettings.default.model}`;
+        lines.push(`  default  ${shown}${modelSettings.applyToUnlabeledSkills ? "" : " (only for unknown tier names)"}`);
+      }
+      const overrides = Object.entries(modelSettings.skillTiers).sort();
+      if (overrides.length > 0) lines.push(`  overrides: ${overrides.map(([n, t]) => `${n}→${t}`).join(", ")}`);
+      if (loaded.size > 0) {
+        lines.push("", "Loaded skills:");
+        for (const name of loaded.keys()) {
+          const skill = skillsByName.get(name);
+          const decision = resolveSkillModel(name, skill ? await skillMetadata(skill) : undefined, modelSettings);
+          const problem = decision.problem ? ` ⚠ ${decision.problem}` : "";
+          const helper = roles.helpers.has(name) ? ", helper" : "";
+          const outcome = modelOutcomes.get(name);
+          lines.push(
+            `  ${name} → ${decision.tier ?? "—"} (${decision.source ?? "no tier"}${helper})${outcome ? ` — ${outcome}` : ""}${problem}`,
+          );
+        }
+      }
+      ctx.ui.notify(lines.join("\n"), "info");
+    },
+  });
+
   pi.registerCommand("skills-on", {
     description: "Enable archiving of irrelevant skill bodies (default)",
     handler: async (_args, ctx) => {
@@ -545,7 +971,7 @@ export default function (pi: ExtensionAPI) {
     description: "Disable archiving; keep every loaded skill body in context",
     handler: async (_args, ctx) => {
       enabled = false;
-      ctx.ui.notify("🔴 Skill body archiving disabled", "info");
+      ctx.ui.notify('🔴 Skill body archiving disabled for this session (set "enabled": false to persist)', "info");
     },
   });
 }

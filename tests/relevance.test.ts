@@ -7,6 +7,7 @@ import { describe, it, expect } from "vitest";
 import {
   bodyExcerpt,
   buildSkillIndex,
+  calledSkills,
   decideRelevance,
   declaredRole,
   inferEntrySkill,
@@ -281,5 +282,44 @@ describe("decideRelevance", () => {
   it("explains rank, share of the best score, and matched terms", () => {
     const d = decideRelevance(index, "explore the data", OPTIONS);
     expect(d.explain("explore-ml-data")).toMatch(/^rank 1\/7, 100% of best \(explor/);
+  });
+});
+
+// ── calledSkills ──────────────────────────────────────────────────
+
+describe("calledSkills", () => {
+  const names = ["build-ml-pipeline", "setup-git", "plot-ml-figure", "persist-ml-git"];
+  const called = (body: string) => [...calledSkills(body, "self", names)].sort();
+
+  it("drops a prohibition, also when the sentence wraps across lines", () => {
+    // Shapes from the probabl pack (frame-ml-problem, model-ml-pipeline).
+    const body = "Do not\n   load `build-ml-pipeline`. Stop this turn. Then load `plot-ml-figure`.";
+    expect(called(body)).toEqual(["plot-ml-figure"]);
+    expect([...mentionedSkills(body, "self", names)].sort()).toEqual(["build-ml-pipeline", "plot-ml-figure"]);
+  });
+
+  it("keeps a call behind a condition or an exception", () => {
+    expect(called("If it is not installed, load `setup-git`.")).toEqual(["setup-git"]);
+    expect(called("Do not commit except by loading `setup-git`.")).toEqual(["setup-git"]);
+  });
+
+  it("drops only the prohibited name in a mixed sentence", () => {
+    expect(called("Do not load `build-ml-pipeline` but load `plot-ml-figure`.")).toEqual(["plot-ml-figure"]);
+  });
+
+  it("recognises the other negations and verbs", () => {
+    for (const body of ["Never load setup-git.", "You must not call `setup-git`.", "Don't use 'setup-git' here."]) {
+      expect(called(body)).toEqual([]);
+    }
+  });
+
+  it("is exposed on the index next to the mentions", () => {
+    const index = buildSkillIndex([
+      { name: "a-skill", description: "First.", body: "Load `b-skill`. Do not load `c-skill`." },
+      { name: "b-skill", description: "Second." },
+      { name: "c-skill", description: "Third." },
+    ]);
+    expect([...index.refs.get("a-skill")!].sort()).toEqual(["b-skill", "c-skill"]);
+    expect([...index.calls.get("a-skill")!]).toEqual(["b-skill"]);
   });
 });

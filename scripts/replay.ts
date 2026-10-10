@@ -2,7 +2,8 @@
  * Replay recorded Pi sessions through the extension and compare strategies.
  *
  *   npm run replay -- --skills <skills-dir> [--config name=file.json ...]
- *                     [--per-session] [--no-reload] <session.jsonl ...>
+ *                     [--orphan-dir <dir>] [--per-session] [--no-reload]
+ *                     <session.jsonl ...>
  *   REPLAY_TRACE=1 npm run replay -- …   # print prompts, archives, orphan uses
  *
  * The real extension is driven through a minimal fake ExtensionAPI: every
@@ -14,9 +15,14 @@
  *
  * Orphan use: a recorded tool call touches the directory of a skill whose
  * body the strategy archived, so the model would have worked without its
- * instructions. Unless --no-reload, the replay then simulates the reload a
- * model following the protocol would make (one extra request, body re-sent),
- * so a wrong eviction pays its price.
+ * instructions. The directory is the skill's own by default; pass
+ * `--orphan-dir <dir>` to measure a specific install (for example the
+ * workspace copy at `<workspace>/.agents/skills`). Sessions recorded while
+ * authoring the skill pack reference the pack source, which counts as an
+ * orphan under the default: they are not a clean end-user corpus.
+ * Unless --no-reload, the replay then simulates the reload a model following
+ * the protocol would make (one extra request, body re-sent), so a wrong
+ * eviction pays its price.
  *
  * Each request is costed by prefix caching (Anthropic ratios: cache read
  * 0.1×, cache write 1.25×): the longest prefix shared with the previous
@@ -46,10 +52,12 @@ const strategies: Array<{ name: string; config?: object; off?: boolean }> = [
 const sessions: string[] = [];
 let perSession = false;
 let reloadOnOrphan = true;
+let orphanDir = "";
 const trace = !!process.env.REPLAY_TRACE;
 for (let i = 0; i < args.length; i++) {
   const a = args[i];
   if (a === "--skills") skillsDir = args[++i];
+  else if (a === "--orphan-dir") orphanDir = args[++i];
   else if (a === "--config") {
     const [name, file] = args[++i].split("=");
     strategies.push({ name, config: JSON.parse(readFileSync(file, "utf-8")) });
@@ -58,7 +66,7 @@ for (let i = 0; i < args.length; i++) {
   else sessions.push(a);
 }
 if (!skillsDir || sessions.length === 0) {
-  console.error("usage: node scripts/replay.ts --skills <dir> [--config name=file.json] [--per-session] <session.jsonl ...>");
+  console.error("usage: node scripts/replay.ts --skills <dir> [--orphan-dir <dir>] [--config name=file.json] [--per-session] <session.jsonl ...>");
   process.exit(2);
 }
 
@@ -81,6 +89,15 @@ const skills = readdirSync(skillsDir, { withFileTypes: true })
 const skillNames = new Set(skills.map((s) => s.name));
 const bodySizes = new Map(skills.map((s) => [s.name, readFileSync(s.filePath, "utf-8").length]));
 const bodySize = (name: string) => bodySizes.get(name) ?? 0;
+
+// Directory a tool call must touch for a skill to count as used: the skill's
+// own directory (`baseDir`), or `--orphan-dir`/<name>/ to measure a specific
+// install root such as `<workspace>/.agents/skills`.
+const toPosix = (p: string) => p.split(path.sep).join("/");
+const orphanRoot = orphanDir ? toPosix(path.resolve(orphanDir)) : undefined;
+const orphanDirs = new Map(
+  skills.map((s) => [s.name, orphanRoot ? `${orphanRoot}/${s.name}/` : `${toPosix(s.baseDir)}/`]),
+);
 
 // ── Session parsing ───────────────────────────────────────────────
 
@@ -123,6 +140,7 @@ function createRuntime(cwd: string) {
     registerCommand: (n: string, o: any) => void commands.set(n, o),
     getActiveTools: () => ["read", "bash", "edit", "write", "skill"],
     appendEntry: () => {},
+    registerEntryRenderer: () => {},
   } as any;
   extension(pi);
   const ctx = {
@@ -249,8 +267,11 @@ async function replay(file: string, strategy: { config?: object; off?: boolean }
       const orphans = new Set<string>();
       for (const c of m.content ?? []) {
         if (c.type !== "toolCall" || c.name === "skill") continue;
-        const blob = JSON.stringify(c.arguments ?? {});
-        for (const name of archived) if (blob.includes(`/${name}/`)) orphans.add(name);
+        const blob = toPosix(JSON.stringify(c.arguments ?? {}));
+        for (const name of archived) {
+          const dir = orphanDirs.get(name);
+          if (dir && blob.includes(dir)) orphans.add(name);
+        }
       }
       if (trace && orphans.size > 0) console.log(`    ⚠️  orphan use at request ${res.requests}: ${[...orphans].join(", ")}`);
       if (orphans.size > 0 && reloadOnOrphan) {
@@ -332,7 +353,11 @@ for (const file of sessions) {
 }
 
 const base = totals.get("keep-all")!;
-console.log(`${sessions.length} sessions, ${base.requests} requests, ${skills.length} skills\n`);
+console.log(
+  `${sessions.length} sessions, ${base.requests} requests, ${skills.length} skills` +
+    (orphanRoot ? `, orphan dir ${orphanRoot}` : "") +
+    "\n",
+);
 console.log("| Strategy | Cost | Peak context | Reloads | Orphan uses |");
 console.log("|---|---|---|---|---|");
 for (const s of strategies) {
