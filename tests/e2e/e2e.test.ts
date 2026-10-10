@@ -7,7 +7,7 @@
 
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -320,5 +320,91 @@ describe.skipIf(!process.env.PI_E2E)("pi end-to-end: derived roles without confi
     expect(explore.text).toContain("Skill body archived");
     expect(persist.text).toContain("Skill body archived");
     expect(setup.text).toContain("Instructions.");
+  });
+});
+
+/**
+ * Model tiers: a skill declares `metadata.modelTier`, the config maps the tier
+ * to a model registered in Pi, and the real session switches before the next
+ * request. The scripted provider registers a second model ("scripted/second")
+ * so the switch is observable in the request log.
+ */
+describe.skipIf(!process.env.PI_E2E)("pi end-to-end: model tier switch", () => {
+  const TIER_SCRIPT = [
+    { tool: "skill", args: { name: "big-skill" } },
+    { text: "used the big model" },
+  ];
+  let workspace: string;
+  let requests: any[];
+
+  beforeAll(() => {
+    workspace = mkdtempSync(join(tmpdir(), "skill-lifecycle-e2e-tier-"));
+    const dir = join(workspace, ".agents", "skills", "big-skill");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      join(dir, "SKILL.md"),
+      `---\nname: big-skill\ndescription: Do the hardest work.\nmetadata:\n  modelTier: big\n---\n\n# big-skill\n\n${"Instructions. ".repeat(400)}\n`,
+    );
+    mkdirSync(join(workspace, ".pi"), { recursive: true });
+    writeFileSync(
+      join(workspace, ".pi", "skill-lifecycle.json"),
+      JSON.stringify({
+        models: {
+          tiers: { big: { provider: "scripted", model: "second", thinkingLevel: "high" } },
+          default: { provider: "scripted", model: "second" },
+        },
+      }),
+    );
+    execFileSync(
+      PI,
+      [
+        "-p", "--offline", "--approve", "--no-extensions",
+        "-e", join(ROOT, "extensions", "index.ts"),
+        "-e", join(ROOT, "tests", "e2e", "scripted-provider.ts"),
+        "--model", "scripted/m",
+        "--session-dir", join(workspace, "sessions"),
+        "do the hardest work",
+      ],
+      {
+        cwd: workspace,
+        env: {
+          ...process.env,
+          PI_CODING_AGENT_DIR: join(workspace, "agent"),
+          E2E_LOG: join(workspace, "requests.jsonl"),
+          E2E_SCRIPT: JSON.stringify(TIER_SCRIPT),
+        },
+        stdio: "pipe",
+        timeout: 60_000,
+      },
+    );
+    requests = readFileSync(join(workspace, "requests.jsonl"), "utf-8").trim().split("\n").map((line) => JSON.parse(line));
+  }, 100_000);
+
+  afterAll(() => {
+    if (workspace) rmSync(workspace, { recursive: true, force: true });
+  });
+
+  it("runs the first request on the session model, then on the skill's tier", () => {
+    expect(requests[0].model).toBe("scripted/m");
+    expect(requests[1].model).toBe("scripted/second");
+  });
+
+  it("switches only for the model, keeping one system prompt", () => {
+    for (const request of requests) expect(request.system).toHaveLength(1);
+  });
+
+  it("records the switch on the session, where the chat draws it", () => {
+    const files = readdirSync(join(workspace, "sessions"), { recursive: true, encoding: "utf-8" }).filter((f) => f.endsWith(".jsonl"));
+    expect(files).toHaveLength(1);
+    const entries = readFileSync(join(workspace, "sessions", files[0]), "utf-8")
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line));
+    const switches = entries.filter((e) => e.type === "custom" && e.customType === "skill-lifecycle-model");
+    expect(switches.map((e) => e.data)).toEqual([
+      expect.objectContaining({ event: "switch", from: "scripted/m", to: "scripted/second", tier: "big", trigger: 'skill("big-skill")' }),
+    ]);
+    // Pi's own record of the selection is there too; ours is what the chat shows.
+    expect(entries.some((e) => e.type === "model_change" && e.modelId === "second")).toBe(true);
   });
 });

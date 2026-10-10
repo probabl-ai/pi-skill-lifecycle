@@ -32,6 +32,15 @@ export default function (pi: ExtensionAPI) {
         contextWindow: 200000,
         maxTokens: 1000,
       },
+      {
+        id: "second",
+        name: "scripted second",
+        reasoning: false,
+        input: ["text"],
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        contextWindow: 200000,
+        maxTokens: 1000,
+      },
     ],
     streamSimple(model, context) {
       const messages = context.messages as any[];
@@ -39,6 +48,7 @@ export default function (pi: ExtensionAPI) {
       appendFileSync(
         log,
         JSON.stringify({
+          model: `${model.provider}/${model.id}`,
           system: system.map((m) => getSystemMessageText(m)),
           systemSections: system.map((m) => m.sections ?? null),
           tools: system.flatMap((m) => (m.tools ?? []).map((t: any) => t.name)),

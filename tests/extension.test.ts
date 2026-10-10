@@ -41,7 +41,7 @@ function writeSkills(root: string, specs: SkillSpec[]): PiSkill[] {
     const filePath = join(baseDir, "SKILL.md");
     writeFileSync(
       filePath,
-      `---\nname: ${spec.name}\ndescription: ${spec.description}\n${spec.frontmatter ? `${spec.frontmatter}\n` : ""}---\n\n${spec.body ?? `Body of ${spec.name}.`}\n`,
+      `---\nname: ${spec.name}\ndescription: ${JSON.stringify(spec.description)}\n${spec.frontmatter ? `${spec.frontmatter}\n` : ""}---\n\n${spec.body ?? `Body of ${spec.name}.`}\n`,
     );
     writeFileSync(join(baseDir, "references", "notes.md"), "notes");
     return {
@@ -64,19 +64,55 @@ const SPECS: SkillSpec[] = [
   { name: "hidden-skill", description: "Only invoked by an explicit command.", disableModelInvocation: true },
 ];
 
+/** Models the fake registry knows about, keyed "provider/modelId". */
+const REGISTRY_KEYS = [
+  "openrouter/moonshotai/kimi-k2.6",
+  "openrouter/deepseek/deepseek-v4.1-flash",
+  "openrouter/qwen/qwen3.7-flash",
+  "openrouter/z-ai/glm-5.3",
+];
+
+function fakeModel(provider: string, id: string) {
+  return { provider, id, name: id };
+}
+
+function modelFromKey(key: string) {
+  const index = key.indexOf("/");
+  return fakeModel(key.slice(0, index), key.slice(index + 1));
+}
+
 function createHarness(
   cwd: string,
   skills: PiSkill[],
   activeTools = ["read", "bash", "edit", "write", "skill"],
   trusted = true,
+  initialModel = REGISTRY_KEYS[0],
 ) {
   const handlers = new Map<string, Handler[]>();
   const tools = new Map<string, any>();
   const commands = new Map<string, any>();
   const notifications: string[] = [];
+  const entries: Array<{ customType: string; data: any }> = [];
+  const entryRenderers = new Map<string, any>();
   let branch: any[] = [];
   let previousSections: Record<string, string> | undefined;
   let callCounter = 0;
+  // Model-tier state: a registry the extension can resolve against, and the
+  // calls it makes. `deny` models a provider without credentials.
+  const registry = new Map<string, any>(REGISTRY_KEYS.map((key) => [key, modelFromKey(key)]));
+  const deny = new Set<string>();
+  // Like Pi: setModel can throw after the auth pre-check, can be slow, re-applies
+  // the default thinking level on a switch, and levels are clamped per model.
+  const failSetModel = new Set<string>();
+  const setModelDelay = new Map<string, number>();
+  const thinkingClamp = new Map<string, string[]>();
+  const clampFor = (key: string, level: string) => {
+    const allowed = thinkingClamp.get(key);
+    return !allowed || allowed.includes(level) ? level : allowed[allowed.length - 1];
+  };
+  const modelCalls: Array<{ provider: string; id: string }> = [];
+  const thinkingCalls: string[] = [];
+  let thinkingLevel = "medium";
 
   const pi = {
     on(event: string, handler: Handler) {
@@ -90,17 +126,43 @@ function createHarness(
       commands.set(name, options);
     },
     getActiveTools: () => activeTools,
+    setModel: async (model: any) => {
+      const key = `${model.provider}/${model.id}`;
+      if (deny.has(key)) return false;
+      const delay = setModelDelay.get(key);
+      if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
+      if (failSetModel.has(key)) throw new Error(`No API key for ${key}`);
+      const previousModel = ctx.model;
+      ctx.model = model;
+      modelCalls.push({ provider: model.provider, id: model.id });
+      thinkingLevel = clampFor(key, "medium");
+      await emit("model_select", { type: "model_select", model, previousModel, source: "set" });
+      return true;
+    },
+    getThinkingLevel: () => thinkingLevel,
+    setThinkingLevel: (level: string) => {
+      thinkingLevel = clampFor(`${ctx.model.provider}/${ctx.model.id}`, level);
+      thinkingCalls.push(level);
+    },
+    appendEntry: (customType: string, data?: unknown) => {
+      entries.push({ customType, data });
+    },
+    registerEntryRenderer: (customType: string, renderer: any) => {
+      entryRenderers.set(customType, renderer);
+    },
   } as unknown as ExtensionAPI;
 
   extension(pi);
 
-  const ctx = {
+  const ctx: any = {
     cwd,
     hasUI: true,
     mode: "tui",
     ui: { notify: (message: string) => notifications.push(message) },
     sessionManager: { getBranch: () => branch },
     isProjectTrusted: () => trusted,
+    modelRegistry: { find: (provider: string, id: string) => registry.get(`${provider}/${id}`) },
+    model: registry.get(initialModel) ?? modelFromKey(initialModel),
   };
 
   async function emit(event: string, payload: any) {
@@ -156,6 +218,17 @@ function createHarness(
     tools,
     commands,
     notifications,
+    entries,
+    entryRenderers,
+    modelCalls,
+    thinkingCalls,
+    registry,
+    deny,
+    failSetModel,
+    setModelDelay,
+    thinkingClamp,
+    getModel: () => ctx.model,
+    thinkingLevel: () => thinkingLevel,
     emit,
     prompt,
     loadSkill,
@@ -638,6 +711,36 @@ describe("derived from the installed skills", () => {
     }
   });
 
+  it("with protectLoader, keeps the body that loaded the new skill", async () => {
+    const h = await startPack({ protectLoader: true }).session;
+    await h.prompt("explore the data");
+    const explore = await h.loadSkill("explore-ml-data");
+    await h.emit("turn_end", { type: "turn_end", toolResults: [explore] });
+    const persist = await h.loadSkill("persist-ml-git");
+    await h.emit("turn_end", { type: "turn_end", toolResults: [persist] });
+    const out = await h.context([explore, persist]);
+    expect(isPlaceholder(out[0])).toBe(false);
+  });
+
+  it("says when an evicted body dispatched to the skill that replaced it", async () => {
+    // explore-ml-data's body says "When done, load `persist-ml-git`".
+    const h = await startPack().session;
+    await h.prompt("explore the data");
+    const explore = await h.loadSkill("explore-ml-data");
+    await h.emit("turn_end", { type: "turn_end", toolResults: [explore] });
+    const persist = await h.loadSkill("persist-ml-git");
+    await h.emit("turn_end", { type: "turn_end", toolResults: [persist] });
+
+    const notice = h.notifications.filter((n) => n.includes("Archived skill bodies")).at(-1)!;
+    expect(notice).toContain("explore-ml-data");
+    expect(notice).toContain("this body calls persist-ml-git");
+    expect(notice).toContain("metadata.role: helper");
+    // The same reason reaches headless runs through the session entry.
+    const record = h.entries.filter((e) => e.customType === "skill-lifecycle").at(-1)!;
+    const reasons = record.data.archived.map((b: any) => b.reason).join("\n");
+    expect(reasons).toContain("metadata.role: helper");
+  });
+
   it("keeps the caller when the loaded skill is related to it", async () => {
     const h = await startPack().session;
     await h.prompt("explore the data");
@@ -709,5 +812,521 @@ describe("derived from the installed skills", () => {
     await h.prompt("hello there");
     await h.commands.get("skills-explain").handler("", h.ctx);
     expect(h.notifications.at(-1)).toContain("Usage: /skills-explain <prompt>");
+  });
+});
+
+// ── Model tiers ───────────────────────────────────────────────────
+
+describe("model tiers", () => {
+  const TIER_CONFIG = {
+    models: {
+      tiers: {
+        small: { provider: "openrouter", model: "qwen/qwen3.7-flash", thinkingLevel: "low" },
+        medium: { provider: "openrouter", model: "deepseek/deepseek-v4.1-flash" },
+        big: { provider: "openrouter", model: "z-ai/glm-5.3", thinkingLevel: "max", scope: "run" },
+      },
+      default: "medium",
+    },
+  };
+
+  const EXTRA_SPECS: SkillSpec[] = [
+    { name: "big-skill", description: "Do the hardest work.", frontmatter: "metadata:\n  modelTier: big" },
+    { name: "small-skill", description: "Do the mechanical work.", frontmatter: "metadata:\n  modelTier: small" },
+    { name: "opt-out-skill", description: "Keep whatever model is current.", frontmatter: "metadata:\n  modelTier: none" },
+  ];
+
+  let tierSkills: PiSkill[];
+  beforeEach(() => {
+    tierSkills = writeSkills(root, [...SPECS, ...EXTRA_SPECS]);
+  });
+
+  const start = (config: object = TIER_CONFIG, withSkills: PiSkill[] = tierSkills) =>
+    startSession(config, undefined, true, withSkills);
+
+  it("switches to the tier a skill declares in its frontmatter", async () => {
+    const h = await start();
+    await h.prompt("do the hardest work");
+    await h.loadSkill("big-skill");
+    expect(h.modelCalls).toEqual([{ provider: "openrouter", id: "z-ai/glm-5.3" }]);
+    expect(h.thinkingCalls).toEqual(["max"]);
+    expect(h.getModel().id).toBe("z-ai/glm-5.3");
+    expect(h.notifications.some((n) => n.includes('tier "big"'))).toBe(true);
+  });
+
+  it("applies the default model to a skill that declares no tier", async () => {
+    const h = await start();
+    await h.prompt("explore the data");
+    await h.loadSkill("explore-ml-data");
+    expect(h.modelCalls).toEqual([{ provider: "openrouter", id: "deepseek/deepseek-v4.1-flash" }]);
+  });
+
+  it("lets the config assign a tier without editing the skill", async () => {
+    const h = await start({ models: { ...TIER_CONFIG.models, skillTiers: { "big-skill": "small" } } });
+    await h.prompt("do the hardest work");
+    await h.loadSkill("big-skill");
+    expect(h.modelCalls).toEqual([{ provider: "openrouter", id: "qwen/qwen3.7-flash" }]);
+    expect(h.thinkingCalls).toEqual(["low"]);
+  });
+
+  it("keeps the current model for a skill that opts out", async () => {
+    const h = await start();
+    await h.prompt("keep whatever model is current");
+    await h.loadSkill("opt-out-skill");
+    expect(h.modelCalls).toEqual([]);
+    expect(h.getModel().id).toBe("moonshotai/kimi-k2.6");
+  });
+
+  it("does not switch unlabeled skills when applyToUnlabeledSkills is false", async () => {
+    const h = await start({ models: { ...TIER_CONFIG.models, applyToUnlabeledSkills: false } });
+    await h.prompt("explore the data");
+    await h.loadSkill("explore-ml-data");
+    expect(h.modelCalls).toEqual([]);
+  });
+
+  it("falls back to the default model when a skill names an unknown tier", async () => {
+    const withTypo = writeSkills(root, [
+      ...SPECS,
+      { name: "typo-skill", description: "Names a tier that does not exist.", frontmatter: "metadata:\n  modelTier: huge" },
+    ]);
+    const h = await start(TIER_CONFIG, withTypo);
+    await h.prompt("typo");
+    await h.loadSkill("typo-skill");
+    expect(h.getModel().id).toBe("deepseek/deepseek-v4.1-flash");
+    expect(h.notifications.some((n) => n.includes('tier "huge" is not defined'))).toBe(true);
+  });
+
+  it("keeps the current model when the tier model is not registered in Pi", async () => {
+    const h = await start();
+    h.registry.delete("openrouter/z-ai/glm-5.3");
+    await h.prompt("do the hardest work");
+    await h.loadSkill("big-skill");
+    expect(h.modelCalls).toEqual([]);
+    expect(h.getModel().id).toBe("moonshotai/kimi-k2.6");
+    expect(h.notifications.some((n) => n.includes("not registered"))).toBe(true);
+  });
+
+  it("keeps the current model when the provider has no credentials", async () => {
+    const h = await start();
+    h.deny.add("openrouter/z-ai/glm-5.3");
+    await h.prompt("do the hardest work");
+    await h.loadSkill("big-skill");
+    expect(h.modelCalls).toEqual([]);
+    expect(h.notifications.some((n) => n.includes("no credentials"))).toBe(true);
+  });
+
+  it("restores a run-scoped tier when the agent settles", async () => {
+    const h = await start();
+    await h.prompt("do the hardest work");
+    await h.loadSkill("big-skill");
+    expect(h.getModel().id).toBe("z-ai/glm-5.3");
+    await h.emit("agent_settled", { type: "agent_settled" });
+    expect(h.getModel().id).toBe("moonshotai/kimi-k2.6");
+    expect(h.thinkingLevel()).toBe("medium");
+  });
+
+  it("keeps a session-scoped tier after the agent settles", async () => {
+    const h = await start();
+    await h.prompt("explore the data");
+    await h.loadSkill("explore-ml-data");
+    await h.emit("agent_settled", { type: "agent_settled" });
+    expect(h.getModel().id).toBe("deepseek/deepseek-v4.1-flash");
+  });
+
+  it("does not switch again when the tier already matches", async () => {
+    const h = await start();
+    await h.prompt("do the mechanical work");
+    await h.loadSkill("small-skill");
+    await h.loadSkill("small-skill");
+    expect(h.modelCalls).toHaveLength(1);
+    expect(h.thinkingCalls).toEqual(["low"]);
+  });
+
+  it("switches for an explicit /skill: command before the first request", async () => {
+    const h = await start();
+    await h.prompt('<skill name="big-skill" location="/skills/big-skill/SKILL.md">body</skill>');
+    expect(h.modelCalls).toEqual([{ provider: "openrouter", id: "z-ai/glm-5.3" }]);
+
+    const raw = await start();
+    await raw.prompt("/skill:small-skill please");
+    expect(raw.modelCalls).toEqual([{ provider: "openrouter", id: "qwen/qwen3.7-flash" }]);
+  });
+
+  it("resets to the model from before the first switch", async () => {
+    const h = await start();
+    await h.prompt("explore the data");
+    await h.loadSkill("explore-ml-data");
+    expect(h.getModel().id).toBe("deepseek/deepseek-v4.1-flash");
+    await h.commands.get("skills-model").handler("reset", h.ctx);
+    expect(h.getModel().id).toBe("moonshotai/kimi-k2.6");
+    expect(h.thinkingLevel()).toBe("medium");
+    expect(h.notifications.at(-1)).toContain("Restored");
+  });
+
+  it("lists the tiers and flags models Pi does not know", async () => {
+    const h = await start();
+    h.registry.delete("openrouter/qwen/qwen3.7-flash");
+    await h.prompt("hi");
+    await h.commands.get("skills-model").handler("", h.ctx);
+    const text = h.notifications.at(-1)!;
+    expect(text).toContain("Model tiers on");
+    expect(text).toContain("z-ai/glm-5.3 max (run)");
+    expect(text).toContain("qwen/qwen3.7-flash low (session) ⚠ not registered");
+    expect(text).toContain('default  tier "medium"');
+  });
+
+  it("does nothing without a models config", async () => {
+    const h = await start({ minKeep: 1 });
+    await h.prompt("do the hardest work");
+    await h.loadSkill("big-skill");
+    expect(h.modelCalls).toEqual([]);
+  });
+});
+
+// ── Archiving switch and headless visibility ──────────────────────
+
+describe("archiving switch and visibility", () => {
+  /** Load explore, then setup mid-run: explore is unrelated, so it is archived. */
+  async function archiveExplore(h: Awaited<ReturnType<typeof startSession>>) {
+    await h.prompt("explore the data");
+    const explore = await h.loadSkill("explore-ml-data");
+    await h.emit("turn_end", { type: "turn_end", toolResults: [explore] });
+    const setup = await h.loadSkill("setup-ml-project");
+    await h.emit("turn_end", { type: "turn_end", toolResults: [setup] });
+    return { explore, setup };
+  }
+
+  it("can be disabled from the config", async () => {
+    const h = await startSession({ enabled: false });
+    const { explore, setup } = await archiveExplore(h);
+    const out = await h.context([explore, setup]);
+    expect(out.some(isPlaceholder)).toBe(false);
+    expect(h.notifications.some((n) => n.includes("Archived skill bodies"))).toBe(false);
+  });
+
+  it("re-applies the configured switch on reload, so it can be persisted", async () => {
+    const h = await startSession({ enabled: false });
+    // A session-only override, then a reload: the config wins again.
+    await h.commands.get("skills-on").handler("", h.ctx);
+    await h.commands.get("skills-reload").handler("", h.ctx);
+    const { explore, setup } = await archiveExplore(h);
+    expect((await h.context([explore, setup])).some(isPlaceholder)).toBe(false);
+  });
+
+  it("keeps the session-only /skills-off working when the config enables archiving", async () => {
+    const h = await startSession({ enabled: true });
+    await h.commands.get("skills-off").handler("", h.ctx);
+    const { explore, setup } = await archiveExplore(h);
+    expect((await h.context([explore, setup])).some(isPlaceholder)).toBe(false);
+  });
+
+  it("records the archive decision on the session for headless runs", async () => {
+    const h = await startSession();
+    await archiveExplore(h);
+    const record = h.entries.filter((e) => e.customType === "skill-lifecycle").at(-1)!;
+    expect(record.data.event).toBe("archived");
+    expect(record.data.archived.map((b: any) => b.name)).toContain("explore-ml-data");
+    expect(record.data.archived[0].reason).toEqual(expect.any(String));
+  });
+
+  it("records nothing when nothing was archived", async () => {
+    const h = await startSession();
+    await h.prompt("explore the data");
+    await h.loadSkill("explore-ml-data");
+    expect(h.entries).toEqual([]);
+  });
+});
+
+// ── Model tiers: robustness (review findings) ─────────────────────
+
+describe("model tiers: robustness", () => {
+  const CONFIG = {
+    models: {
+      tiers: {
+        small: { provider: "openrouter", model: "qwen/qwen3.7-flash", thinkingLevel: "low" },
+        medium: { provider: "openrouter", model: "deepseek/deepseek-v4.1-flash", thinkingLevel: "high" },
+        big: { provider: "openrouter", model: "z-ai/glm-5.3", thinkingLevel: "max", scope: "run" },
+      },
+      default: "medium",
+    },
+  };
+  const EXTRA: SkillSpec[] = [
+    { name: "big-skill", description: "Do the hardest work.", frontmatter: "metadata:\n  modelTier: big" },
+    { name: "small-skill", description: "Do the mechanical work.", frontmatter: "metadata:\n  modelTier: small" },
+    {
+      name: "coordinator",
+      description: "Coordinate the study.",
+      frontmatter: "metadata:\n  modelTier: big",
+      body: "Load `step-skill` for the sub-step, then continue.",
+    },
+    { name: "step-skill", description: "Run one sub-step.", frontmatter: "metadata:\n  role: helper\n  modelTier: small" },
+    { name: "router", description: "Route the request.", frontmatter: "metadata:\n  role: entry\n  modelTier: medium" },
+    { name: "deep-skill", description: "Think very deeply.", frontmatter: "metadata:\n  modelTier: deep" },
+    { name: "aux-helper", description: "Run another sub-step.", frontmatter: "metadata:\n  role: helper\n  modelTier: medium" },
+  ];
+  let tierSkills: PiSkill[];
+  beforeEach(() => {
+    tierSkills = writeSkills(root, [...SPECS, ...EXTRA]);
+  });
+  const start = (config: object = CONFIG) => startSession(config, undefined, true, tierSkills);
+  const switches = (h: ReturnType<typeof createHarness>) => h.notifications.filter((n) => n.startsWith("🎚️"));
+
+  it("still loads the skill when the model switch fails", async () => {
+    const h = await start();
+    h.failSetModel.add("openrouter/z-ai/glm-5.3");
+    await h.prompt("do the hardest work");
+    const message = await h.loadSkill("big-skill");
+    expect(textOf(message)).toContain('<skill_content name="big-skill">');
+    expect(h.getModel().id).toBe("moonshotai/kimi-k2.6");
+    expect(h.notifications.some((n) => n.includes("could not switch"))).toBe(true);
+  });
+
+  it("applies the tier's thinking level even though a model switch resets it", async () => {
+    const h = await start();
+    h.pi.setThinkingLevel("high"); // raised by the user before the switch
+    await h.prompt("explore the data");
+    await h.loadSkill("explore-ml-data"); // default tier: medium, thinking high
+    expect(h.getModel().id).toBe("deepseek/deepseek-v4.1-flash");
+    expect(h.thinkingLevel()).toBe("high");
+  });
+
+  it("accepts thinkingLevel off", async () => {
+    const h = await start({
+      models: { tiers: { small: { provider: "openrouter", model: "qwen/qwen3.7-flash", thinkingLevel: "off" } }, default: "small" },
+    });
+    await h.prompt("do the mechanical work");
+    await h.loadSkill("small-skill");
+    expect(h.thinkingLevel()).toBe("off");
+  });
+
+  it("does not re-announce a tier whose thinking level the model clamps", async () => {
+    const h = await start({
+      models: { tiers: { small: { provider: "openrouter", model: "qwen/qwen3.7-flash", thinkingLevel: "max" } }, default: "small" },
+    });
+    h.thinkingClamp.set("openrouter/qwen/qwen3.7-flash", ["low", "high"]);
+    await h.prompt("do the mechanical work");
+    await h.loadSkill("small-skill");
+    await h.loadSkill("small-skill");
+    expect(switches(h)).toHaveLength(1);
+  });
+
+  it("restores a run-scoped tier to the model active when that run started", async () => {
+    const h = await start();
+    await h.prompt("explore the data");
+    await h.loadSkill("explore-ml-data"); // medium, session-scoped
+    await h.emit("agent_settled", { type: "agent_settled" });
+    await h.prompt("do the hardest work");
+    await h.loadSkill("big-skill"); // big, run-scoped
+    await h.emit("agent_settled", { type: "agent_settled" });
+    expect(h.getModel().id).toBe("deepseek/deepseek-v4.1-flash");
+  });
+
+  it("restores a run-scoped tier to the model just before it, within one run", async () => {
+    const h = await start();
+    await h.prompt("explore then work hard");
+    await h.loadSkill("explore-ml-data"); // medium, session
+    await h.loadSkill("big-skill"); // big, run
+    await h.emit("agent_settled", { type: "agent_settled" });
+    expect(h.getModel().id).toBe("deepseek/deepseek-v4.1-flash");
+  });
+
+  it("keeps a session-scoped tier chosen after a run-scoped one", async () => {
+    const h = await start();
+    await h.prompt("work hard then do the mechanical part");
+    await h.loadSkill("big-skill"); // big, run
+    await h.loadSkill("small-skill"); // small, session: supersedes the temporary tier
+    await h.emit("agent_settled", { type: "agent_settled" });
+    expect(h.getModel().id).toBe("qwen/qwen3.7-flash");
+  });
+
+  it("restores the model from before the first of two run-scoped tiers", async () => {
+    const h = await start({
+      models: {
+        ...CONFIG.models,
+        tiers: { ...CONFIG.models.tiers, deep: { provider: "openrouter", model: "deepseek/deepseek-v4.1-flash", scope: "run" } },
+      },
+    });
+    await h.prompt("work hard, then think deeply");
+    await h.loadSkill("big-skill"); // run-scoped glm
+    await h.loadSkill("deep-skill"); // another run-scoped tier: our own switch, not the user's
+    await h.emit("agent_settled", { type: "agent_settled" });
+    expect(h.getModel().id).toBe("moonshotai/kimi-k2.6");
+  });
+
+  it("does not override a model the user picked during a run-scoped tier", async () => {
+    const h = await start();
+    await h.prompt("explore then work hard");
+    await h.loadSkill("explore-ml-data"); // medium, session
+    await h.loadSkill("big-skill"); // big, run: would restore medium at settle
+    // The user picks a model with /model: Pi reports it with source "set" too.
+    const picked = h.registry.get("openrouter/qwen/qwen3.7-flash");
+    const previousModel = h.ctx.model;
+    h.ctx.model = picked;
+    await h.emit("model_select", { type: "model_select", model: picked, previousModel, source: "set" });
+    await h.emit("agent_settled", { type: "agent_settled" });
+    expect(h.getModel().id).toBe("qwen/qwen3.7-flash");
+  });
+
+  it("does not throw when restoring a run-scoped tier fails", async () => {
+    const h = await start();
+    await h.prompt("do the hardest work");
+    await h.loadSkill("big-skill");
+    h.failSetModel.add("openrouter/moonshotai/kimi-k2.6");
+    await expect(h.emit("agent_settled", { type: "agent_settled" })).resolves.toBeUndefined();
+    await expect(h.commands.get("skills-model").handler("reset", h.ctx)).resolves.not.toThrow();
+  });
+
+  it("applies tiers in call order when skills load in parallel", async () => {
+    const h = await start();
+    h.setModelDelay.set("openrouter/z-ai/glm-5.3", 30); // the first switch is the slow one
+    await h.prompt("do two things");
+    await Promise.all([h.loadSkill("big-skill"), h.loadSkill("small-skill")]);
+    expect(h.getModel().id).toBe("qwen/qwen3.7-flash");
+  });
+
+  it("keeps the caller's model when a helper is loaded mid-task", async () => {
+    const h = await start();
+    await h.prompt("coordinate the study");
+    await h.loadSkill("coordinator"); // big
+    await h.loadSkill("step-skill"); // small helper; the coordinator keeps working
+    expect(h.getModel().id).toBe("z-ai/glm-5.3");
+  });
+
+  /**
+   * One assistant message loading several skills, as Pi runs it: every call is
+   * prepared first (firing `tool_call`), then all of them execute together.
+   */
+  async function loadTogether(h: ReturnType<typeof createHarness>, names: string[]) {
+    for (const [i, name] of names.entries()) {
+      await h.emit("tool_call", { type: "tool_call", toolCallId: `batch-${i}`, toolName: "skill", input: { name } });
+    }
+    const results = await Promise.all(names.map((name) => h.loadSkill(name)));
+    await h.emit("turn_end", { type: "turn_end", toolResults: results });
+    return results;
+  }
+
+  it("keeps the caller's model when caller and helper load in the same message, in either order", async () => {
+    for (const order of [["coordinator", "step-skill"], ["step-skill", "coordinator"]]) {
+      const h = await start();
+      await h.prompt("coordinate the study");
+      await loadTogether(h, order);
+      expect(h.getModel().id).toBe("z-ai/glm-5.3");
+      // The helper never switched: one switch, to the caller's tier.
+      expect(h.modelCalls).toEqual([{ provider: "openrouter", id: "z-ai/glm-5.3" }]);
+    }
+  });
+
+  it("lets sibling helpers loaded without a caller apply their tiers in call order", async () => {
+    const h = await start();
+    await h.prompt("two sub-steps");
+    await loadTogether(h, ["aux-helper", "step-skill"]);
+    expect(h.getModel().id).toBe("qwen/qwen3.7-flash");
+  });
+
+  it("forgets the message's batch at turn end", async () => {
+    const h = await start();
+    await h.prompt("coordinate the study");
+    // A skill call that was requested but never ran (blocked by another extension, say).
+    await h.emit("tool_call", { type: "tool_call", toolCallId: "blocked", toolName: "skill", input: { name: "coordinator" } });
+    await h.emit("turn_end", { type: "turn_end", toolResults: [] });
+    await h.loadSkill("step-skill"); // next message: no caller loaded or requested
+    expect(h.getModel().id).toBe("qwen/qwen3.7-flash");
+  });
+
+  it("shows in /skills-model what each load did to the model, and says when a helper kept it", async () => {
+    const h = await start();
+    await h.prompt("coordinate the study");
+    await h.loadSkill("coordinator");
+    await h.loadSkill("step-skill");
+    expect(h.notifications).toContainEqual(
+      expect.stringContaining('skill("step-skill") keeps openrouter/z-ai/glm-5.3: helper loaded by a working caller (tier "small" not applied)'),
+    );
+    await h.commands.get("skills-model").handler("", h.ctx);
+    const text = h.notifications.at(-1)!;
+    expect(text).toContain("coordinator → big (frontmatter) — switched to openrouter/z-ai/glm-5.3");
+    expect(text).toContain(
+      'step-skill → small (frontmatter, helper) — kept openrouter/z-ai/glm-5.3 (helper of a working caller; tier "small" not applied)',
+    );
+  });
+
+  it("applies a helper's own tier when only the entry skill is loaded", async () => {
+    const h = await start();
+    await h.prompt("route this");
+    await h.loadSkill("router"); // entry, medium
+    await h.loadSkill("step-skill"); // helper with no working caller
+    expect(h.getModel().id).toBe("qwen/qwen3.7-flash");
+  });
+
+  const modelEvents = (h: ReturnType<typeof createHarness>) =>
+    h.entries.filter((e) => e.customType === "skill-lifecycle-model").map((e) => e.data);
+
+  it("records each model switch on the session and draws it in the chat", async () => {
+    const h = await start();
+    await h.prompt("do the hardest work");
+    await h.loadSkill("big-skill");
+    expect(modelEvents(h)).toEqual([
+      {
+        event: "switch",
+        from: "openrouter/moonshotai/kimi-k2.6",
+        to: "openrouter/z-ai/glm-5.3",
+        thinkingLevel: "max",
+        trigger: 'skill("big-skill")',
+        tier: "big",
+        source: "frontmatter",
+        scope: "run",
+      },
+    ]);
+    // Drawn through pi-tui's Text, as Pi's chat does it.
+    const render = h.entryRenderers.get("skill-lifecycle-model");
+    const theme = { fg: (_color: string, text: string) => text, bg: (_color: string, text: string) => text };
+    const entry = { type: "custom", customType: "skill-lifecycle-model", data: modelEvents(h)[0] };
+    expect(render(entry, { expanded: false }, theme).render(160).join("\n")).toContain(
+      'Model openrouter/z-ai/glm-5.3 (thinking max) · tier "big" for skill("big-skill"), this run only',
+    );
+    expect(render(entry, { expanded: true }, theme).render(160).join("\n")).toContain("was openrouter/moonshotai/kimi-k2.6");
+  });
+
+  it("records the restore at the end of a run-scoped tier, and a reset", async () => {
+    const h = await start();
+    await h.prompt("do the hardest work");
+    await h.loadSkill("big-skill"); // big, run-scoped
+    await h.emit("agent_settled", { type: "agent_settled" });
+    await h.loadSkill("explore-ml-data"); // medium, session
+    await h.commands.get("skills-model").handler("reset", h.ctx);
+    expect(modelEvents(h).map((e) => [e.event, e.to])).toEqual([
+      ["switch", "openrouter/z-ai/glm-5.3"],
+      ["restore", "openrouter/moonshotai/kimi-k2.6"],
+      ["switch", "openrouter/deepseek/deepseek-v4.1-flash"],
+      ["reset", "openrouter/moonshotai/kimi-k2.6"],
+    ]);
+    expect(modelEvents(h)[1]).toMatchObject({ from: "openrouter/z-ai/glm-5.3", tier: "big" });
+  });
+
+  it("records nothing when the model does not change", async () => {
+    const h = await start();
+    h.failSetModel.add("openrouter/z-ai/glm-5.3");
+    await h.prompt("coordinate the study");
+    await h.loadSkill("big-skill"); // the switch fails
+    h.failSetModel.clear();
+    await h.loadSkill("coordinator"); // switches
+    await h.loadSkill("step-skill"); // helper: keeps the caller's model
+    await h.loadSkill("coordinator"); // already on the tier
+    expect(modelEvents(h).map((e) => e.trigger)).toEqual(['skill("coordinator")']);
+  });
+
+  it("records no model change when verbose is off", async () => {
+    const h = await start({ ...CONFIG, verbose: false });
+    await h.prompt("do the hardest work");
+    await h.loadSkill("big-skill");
+    expect(h.getModel().id).toBe("z-ai/glm-5.3");
+    expect(modelEvents(h)).toEqual([]);
+  });
+
+  it("reports a misconfigured tier once per session, not on every load", async () => {
+    const h = await start();
+    h.registry.delete("openrouter/z-ai/glm-5.3");
+    await h.prompt("do the hardest work");
+    await h.loadSkill("big-skill");
+    await h.loadSkill("big-skill");
+    expect(h.notifications.filter((n) => n.includes("not registered"))).toHaveLength(1);
   });
 });

@@ -39,6 +39,10 @@ model to `read` the SKILL.md when a task matches. This extension:
    descriptions, and headings, and the entry skill is inferred from
    cross-references (see [How relevance is derived](#how-relevance-is-derived)).
    A config file can still override any of it.
+6. **Can switch models per skill** (optional): a skill declares a tier
+   (`metadata.modelTier`), the `models` config maps tiers to models Pi already
+   knows, and the extension switches with `pi.setModel()` — no new provider or
+   API key. See [Model tiers](#model-tiers).
 
 If the `skill` tool is not active (for example `--tools read,bash`), Pi's
 default listing is left unchanged and no read is blocked.
@@ -79,7 +83,21 @@ next request of the same run:
   its instructions. Helper bodies are evicted like any other body when a
   non-helper skill is loaded later.
 
-Set `evictOnSkillLoad` to `false` to only evict at user prompts.
+An evicted body that tells the model to load the new skill — the body that
+probably dispatched to it — is labelled as such in the reason (a prohibition
+such as "Do not load `x`", even wrapped across lines, is not a call):
+`superseded by build-ml-pipeline (…); this body calls build-ml-pipeline —
+declare metadata.role: helper to keep it`. In the measured pack, 52% of
+mid-run evictions were of this kind, which is why declaring
+`metadata.role: helper` on sub-step skills is the precise fix; the eviction
+reasons point at it. `protectCallers` and `protectLoader` keep more bodies
+without that declaration, and both cost more than they bought on the measured
+corpus — leave them off unless you cannot edit the pack.
+
+Set `evictOnSkillLoad` to `false` to only evict at user prompts. That is not
+cheaper: on the measured corpus it cost 104.5% of never archiving (the defaults
+cost 87.4%), because the user-prompt evictions still invalidate the prompt
+cache, while the mid-run savings are forgone.
 
 The entry skill is pinned by default (`pinEntrySkill`): the protocol sends
 the model back to it after every stage, so archiving it only forces reloads.
@@ -202,21 +220,113 @@ Example:
 | `entrySkill` | `""` | Entry skill; overrides the frontmatter and inference; mentioned only if installed |
 | `pinEntrySkill` | `true` | Never evict the entry skill's body |
 | `helperSkills` | `[]` | Helpers in addition to `metadata.role: helper`; loading one mid-run evicts nothing |
-| `protectCallers` | `false` | On a mid-run load, keep bodies whose skill names the loaded skill |
+| `protectCallers` | `false` | On a mid-run load, keep bodies whose skill tells the model to load the loaded skill ("Do not load" mentions excluded) |
+| `protectLoader` | `false` | On a mid-run load, keep the body loaded immediately before the new one |
 | `rules` | `[]` | Keyword rules (`skillName`, `keywords`, optional `weight`) that keep a body when they match |
 | `threshold` | `0.15` | Minimum rule score (matched keyword fraction × weight) for a rule to keep a body |
 | `pinned` | `[]` | Skills whose bodies are never evicted |
 | `minKeep` | `2` | The N most recently loaded bodies are never evicted at a user prompt |
 | `maxKeep` | `0` | Maximum number of loaded bodies (0 = unlimited) |
 | `evictOnSkillLoad` | `true` | Evict unrelated bodies as soon as another skill is loaded mid-run |
+| `enabled` | `true` | Archive at all; the persisted counterpart of `/skills-off` |
 | `blockDirectSkillReads` | `true` | Block `read` on a known SKILL.md and point to the `skill` tool |
-| `verbose` | `true` | Notify when bodies are loaded or archived |
+| `verbose` | `true` | Notify when bodies are loaded or archived, and show each model change in the chat |
+| `models` | see below | Model tiers: map `metadata.modelTier` to models already registered in Pi |
 | `skipOnShortPrompts` | `true` | Skip judging for very short follow-ups |
 | `minScorablePromptLength` | `15` | Prompts shorter than this skip judging |
 | `topicChangeThreshold` | `0.7` | Word overlap above which a prompt counts as the same topic |
 
 An invalid config file is reported and ignored. A `skill-lifecycle.json` at the
 root of the working directory is not read.
+
+## Model tiers
+
+A skill can ask for a *tier* of model instead of naming one, so the same skill
+pack works with whatever models you have configured. The skill declares the
+tier; the `models` config maps tiers to models. The extension resolves the tier
+against Pi's model registry and calls `pi.setModel()`, so **it never adds a
+provider, an API key, or a request header** — a tier can only name a model you
+already use in Pi. When the model is unknown or unauthenticated, the current
+model is kept and the reason is reported.
+
+```yaml
+---
+name: build-ml-pipeline
+description: Build the ML pipeline from data source to predictor.
+metadata:
+  modelTier: big        # small | medium | big | any name you define
+---
+```
+
+Nothing switches until you define tiers. A starting point on OpenRouter:
+
+```json
+{
+  "models": {
+    "tiers": {
+      "small":  { "provider": "openrouter", "model": "qwen/qwen3.7-flash", "thinkingLevel": "low" },
+      "medium": { "provider": "openrouter", "model": "deepseek/deepseek-v4.1-flash" },
+      "big":    { "provider": "openrouter", "model": "z-ai/glm-5.3", "thinkingLevel": "max", "scope": "run" }
+    },
+    "default": "medium",
+    "skillTiers": { "legacy-skill": "big" },
+    "applyToUnlabeledSkills": true
+  }
+}
+```
+
+| Key | Default | Description |
+|---|---|---|
+| `models.enabled` | `true` | Switch models when a skill declares a tier |
+| `models.tiers` | `{}` | Tier name → `{ provider, model, thinkingLevel?, scope? }`, using Pi model ids |
+| `models.default` | `null` | Model (or tier name) used when a skill declares no tier, and when it names a tier that is not defined. `null` leaves the current model |
+| `models.skillTiers` | `{}` | Per-skill tier overrides, so you can tier a skill you do not want to edit |
+| `models.applyToUnlabeledSkills` | `true` | Apply `default` to skills that declare no tier. `false` still falls back to `default` for an unknown tier name |
+
+- **Precedence**: `models.skillTiers` (config) → `metadata.modelTier`
+  (frontmatter) → `models.default`.
+- **Opt out**: `modelTier: none` (or `off`) keeps the current model for that
+  skill, even when a `default` is configured.
+- **Thinking level**: an optional `thinkingLevel` (`off` to `max`) is set
+  together with the model. Pi clamps it to what the model supports, so
+  `medium` on a model with only `low`/`high`/`max` becomes the closest
+  supported level. Without one, the level is whatever Pi applies on any model
+  switch (the per-model or global default), not the previous level.
+- **Scope**: `"session"` (the default) keeps the model until another skill
+  switches it. `"run"` restores, when the agent settles, the model active just
+  before that tier, so an expensive tier is used for the run that asked for it
+  only. A session-scoped switch later in the same run, or a model you pick
+  yourself (`/model`), supersedes it and is kept.
+- **Helpers keep their caller's model**: a `metadata.role: helper` skill
+  does not switch the model while its caller keeps working afterwards: when
+  another skill (other than the entry skill) is loaded, or a non-helper skill
+  is requested in the same assistant message, in either order. A helper
+  loaded on its own, or with `/skill:name`, applies its tier. The notice
+  `🎚️ skill("plot-ml-figure") keeps … (tier "small" not applied)` says when
+  that happened.
+- **Parallel loads**: skills loaded by one assistant message switch one at a
+  time in call order, so the last one that switches wins.
+- **Failures never block a skill**: a model that is unknown, has no
+  credentials, or fails to switch is reported once per session, and the skill
+  loads on the current model.
+- **Explicit commands**: `/skill:name` switches too, before the first request
+  of the run. `/skills-model` shows the resolved config and, for each loaded
+  skill, its tier, whether it is a helper, and what its latest load did
+  (`switched to …`, `already on …`, `kept … (helper of a working caller)`).
+  `/skills-model reset` goes back to the model from before the first switch.
+
+Every model change the extension makes stays visible in the chat, also after
+resuming the session: a tier switch, the restore at the end of a run-scoped
+tier, and `/skills-model reset`. Pi records its own `model_change` entries but
+does not draw them, and a notification disappears, so the extension records a
+`skill-lifecycle-model` entry and draws it as one line (expand tool output,
+`Ctrl+O`, to also see the previous model and where the tier came from). The
+entry is never sent to the model, and `verbose: false` turns it off.
+
+```
+🎚️ Model openrouter/z-ai/glm-5.3 (thinking max) · tier "big" for skill("build-ml-pipeline"), this run only
+🎚️ Model openrouter/moonshotai/kimi-k2.6 (thinking medium) · restored at the end of the run (tier "big" was for that run only)
+```
 
 ## Commands
 
@@ -227,6 +337,7 @@ root of the working directory is not read.
 | `/skills-list` | Known skills with pinned and loaded status, and their roles with the source (config, frontmatter, inferred) |
 | `/skills-explain <prompt>` | Ranking of the skills for a prompt, matched terms, and what would happen to each loaded body |
 | `/skills-reload` | Reload `skill-lifecycle.json` |
+| `/skills-model` | Show the model-tier config, the current model, and the tier of each loaded skill; `/skills-model reset` restores the model from before the first switch |
 | `/skills-on` / `/skills-off` | Enable or disable archiving |
 
 ## Limitations
@@ -234,8 +345,16 @@ root of the working directory is not read.
 - `bash` commands such as `cat SKILL.md` are not intercepted.
 - Bodies loaded with `/skill:name` are injected by Pi into the user message and
   are not archived.
+- Switching models loses the provider's prompt cache from that point, once;
+  loading a skill again at the same tier does not switch again.
+- A tier can only name a model already in Pi's registry with credentials. A
+  model that Pi does not know, or that has no API key, is reported and ignored;
+  add it to `models.json` first (`pi`'s model configuration) if needed.
 - Archiving a body changes an earlier message, so the provider's prompt cache is
   invalidated from that point once, on the request where the body is archived.
+- Every archive decision is recorded on the session as a `skill-lifecycle`
+  entry, so a headless run (`pi -p`, JSON, replay) can explain what was archived
+  and why. The entry is not sent to the model.
 - `/skills-pin` pins last for the session; use `pinned` in the config to persist.
 - Relevance is lexical: "fit a model" does not match a skill that only says
   "estimator". Prompts in another language than the skills mostly match
@@ -253,15 +372,26 @@ npm run test:e2e    # real Pi process with an offline scripted provider
                     # PI_BIN=/path/to/pi selects the Pi executable
 npm run replay -- --skills <skills-dir> [--config name=file.json] ~/.pi/agent/sessions/<project>/*.jsonl
                     # replay recorded sessions and compare strategies
+                    # --orphan-dir <dir> measures a specific install root
 ```
 
+`replay` counts an *orphan use* when a recorded tool call touches the directory
+of a skill whose body the strategy archived: the model would have worked without
+its instructions. The directory is the skill's own by default; pass
+`--orphan-dir <dir>` to measure a workspace install such as
+`<workspace>/.agents/skills`. Sessions recorded while *authoring* a skill pack
+reference the pack source, so they inflate the count and are not a clean
+end-user corpus.
+
 ```
-extensions/index.ts         events, skill tool, commands, index cache
+extensions/index.ts         events, skill tool, commands, index cache, model switching
 extensions/relevance.ts     pure logic: terms, BM25 index, references, roles
 extensions/rules.ts         pure logic: config, roles, eviction decisions
+extensions/models.ts        pure logic: model tiers, config normalization, skill → tier
 scripts/replay.ts           replay recorded sessions through the extension
 tests/relevance.test.ts     relevance.ts
 tests/rules.test.ts         rules.ts
+tests/models.test.ts        models.ts
 tests/extension.test.ts     extension through a fake ExtensionAPI
 tests/e2e/                  scripted provider + end-to-end test
 ```
