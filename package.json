@@ -1,6 +1,6 @@
 {
   "name": "@probabl/pi-skill-lifecycle",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "OpenCode-style skill loading for Pi: a skill tool, a binding protocol, and archiving of skill bodies that are no longer relevant, with no configuration.",
   "keywords": [
     "pi-package",
