@@ -72,8 +72,17 @@ const REGISTRY_KEYS = [
   "openrouter/z-ai/glm-5.3",
 ];
 
+/** Price per million tokens, as Pi's registry lists them (OpenRouter, October 2026). */
+const PRICES: Record<string, { input: number; output: number; cacheRead: number; cacheWrite: number }> = {
+  "openrouter/moonshotai/kimi-k2.6": { input: 0.465, output: 2.45, cacheRead: 0.0975, cacheWrite: 0 },
+  "openrouter/deepseek/deepseek-v4.1-flash": { input: 0.3, output: 1.2, cacheRead: 0.006, cacheWrite: 0 },
+  "openrouter/qwen/qwen3.7-flash": { input: 0.03, output: 0.13, cacheRead: 0.006, cacheWrite: 0.038 },
+  "openrouter/z-ai/glm-5.3": { input: 0.04, output: 4.8, cacheRead: 0.039, cacheWrite: 0 },
+};
+
 function fakeModel(provider: string, id: string) {
-  return { provider, id, name: id };
+  const cost = PRICES[`${provider}/${id}`];
+  return { provider, id, name: id, ...(cost ? { cost } : {}) };
 }
 
 function modelFromKey(key: string) {
@@ -1062,7 +1071,10 @@ describe("model tiers: robustness", () => {
     { name: "router", description: "Route the request.", frontmatter: "metadata:\n  role: entry\n  modelTier: medium" },
     { name: "deep-skill", description: "Think very deeply.", frontmatter: "metadata:\n  modelTier: deep" },
     { name: "aux-helper", description: "Run another sub-step.", frontmatter: "metadata:\n  role: helper\n  modelTier: medium" },
+    { name: "big-helper", description: "Run a demanding sub-step.", frontmatter: "metadata:\n  role: helper\n  modelTier: big" },
   ];
+  /** The behavior before 0.4: a helper of a working caller never switches. */
+  const KEEP = { models: { ...CONFIG.models, helperTierPolicy: "keep" } };
   let tierSkills: PiSkill[];
   beforeEach(() => {
     tierSkills = writeSkills(root, [...SPECS, ...EXTRA]);
@@ -1183,8 +1195,8 @@ describe("model tiers: robustness", () => {
     expect(h.getModel().id).toBe("qwen/qwen3.7-flash");
   });
 
-  it("keeps the caller's model when a helper is loaded mid-task", async () => {
-    const h = await start();
+  it("keeps the caller's model when a helper is loaded mid-task, with helperTierPolicy keep", async () => {
+    const h = await start(KEEP);
     await h.prompt("coordinate the study");
     await h.loadSkill("coordinator"); // big
     await h.loadSkill("step-skill"); // small helper; the coordinator keeps working
@@ -1204,9 +1216,9 @@ describe("model tiers: robustness", () => {
     return results;
   }
 
-  it("keeps the caller's model when caller and helper load in the same message, in either order", async () => {
+  it("keeps the caller's model when caller and helper load in the same message, in either order, with keep", async () => {
     for (const order of [["coordinator", "step-skill"], ["step-skill", "coordinator"]]) {
-      const h = await start();
+      const h = await start(KEEP);
       await h.prompt("coordinate the study");
       await loadTogether(h, order);
       expect(h.getModel().id).toBe("z-ai/glm-5.3");
@@ -1233,7 +1245,7 @@ describe("model tiers: robustness", () => {
   });
 
   it("shows in /skills-model what each load did to the model, and says when a helper kept it", async () => {
-    const h = await start();
+    const h = await start(KEEP);
     await h.prompt("coordinate the study");
     await h.loadSkill("coordinator");
     await h.loadSkill("step-skill");
@@ -1258,6 +1270,135 @@ describe("model tiers: robustness", () => {
 
   const modelEvents = (h: ReturnType<typeof createHarness>) =>
     h.entries.filter((e) => e.customType === "skill-lifecycle-model").map((e) => e.data);
+
+  describe("helperTierPolicy allow-downgrade (default)", () => {
+    const settle = (h: ReturnType<typeof createHarness>) => h.emit("agent_settled", { type: "agent_settled" });
+
+    it("lets a cheaper helper switch down under a big caller, for the rest of the run", async () => {
+      const h = await start();
+      await h.prompt("coordinate the study");
+      await h.loadSkill("coordinator"); // big glm-5.3, run-scoped
+      await h.loadSkill("step-skill"); // small helper: qwen3.7-flash is cheaper
+      expect(h.getModel().id).toBe("qwen/qwen3.7-flash");
+      expect(h.thinkingLevel()).toBe("low");
+      expect(modelEvents(h).at(-1)).toMatchObject({
+        event: "switch",
+        to: "openrouter/qwen/qwen3.7-flash",
+        tier: "small",
+        trigger: 'skill("step-skill")',
+        scope: "run",
+        helper: true,
+      });
+      await settle(h);
+      expect(h.getModel().id).toBe("moonshotai/kimi-k2.6"); // the model from before the run
+    });
+
+    it("restores a session-scoped caller's model at the end of the run", async () => {
+      const h = await start();
+      await h.prompt("explore the data");
+      await h.loadSkill("explore-ml-data"); // medium, session-scoped, thinking high
+      await h.loadSkill("step-skill"); // small helper: cheaper
+      expect(h.getModel().id).toBe("qwen/qwen3.7-flash");
+      await settle(h);
+      expect(h.getModel().id).toBe("deepseek/deepseek-v4.1-flash");
+      expect(h.thinkingLevel()).toBe("high");
+    });
+
+    it("never upgrades the caller's model", async () => {
+      const h = await start();
+      await h.prompt("explore the data");
+      await h.loadSkill("explore-ml-data"); // medium
+      await h.loadSkill("big-helper"); // big helper: pricier, refused
+      expect(h.getModel().id).toBe("deepseek/deepseek-v4.1-flash");
+      expect(h.notifications).toContainEqual(
+        expect.stringContaining(
+          'skill("big-helper") keeps openrouter/deepseek/deepseek-v4.1-flash: helper loaded by a working caller (tier "big" not applied: not cheaper than the caller\'s openrouter/deepseek/deepseek-v4.1-flash)',
+        ),
+      );
+    });
+
+    it("compares with the caller's model, so a medium helper can follow a small one", async () => {
+      const h = await start();
+      await h.prompt("coordinate the study");
+      await h.loadSkill("coordinator"); // big glm-5.3
+      await h.loadSkill("step-skill"); // small: qwen3.7-flash
+      await h.loadSkill("aux-helper"); // medium: dearer than qwen3.7-flash, cheaper than the caller's glm-5.3
+      expect(h.getModel().id).toBe("deepseek/deepseek-v4.1-flash");
+      await settle(h);
+      expect(h.getModel().id).toBe("moonshotai/kimi-k2.6");
+    });
+
+    it("lets a helper switch back up to the caller's model, not above it", async () => {
+      const h = await start();
+      await h.prompt("coordinate the study");
+      await h.loadSkill("coordinator"); // big glm-5.3, thinking max
+      await h.loadSkill("step-skill"); // down to qwen3.7-flash
+      await h.loadSkill("big-helper"); // big: the caller's own model and level
+      expect(h.getModel().id).toBe("z-ai/glm-5.3");
+      expect(h.thinkingLevel()).toBe("max");
+    });
+
+    it("treats a lower thinking level on the same model as cheaper", async () => {
+      // small and medium share a model and differ by thinking level only.
+      const h = await start({
+        models: {
+          tiers: {
+            small: { provider: "openrouter", model: "deepseek/deepseek-v4.1-flash", thinkingLevel: "low" },
+            medium: { provider: "openrouter", model: "deepseek/deepseek-v4.1-flash", thinkingLevel: "high" },
+            big: { provider: "openrouter", model: "z-ai/glm-5.3", thinkingLevel: "max", scope: "run" },
+          },
+          default: "medium",
+        },
+      });
+      await h.prompt("explore the data");
+      await h.loadSkill("explore-ml-data"); // medium: deepseek, high
+      await h.loadSkill("step-skill"); // small: same model, low
+      expect(h.getModel().id).toBe("deepseek/deepseek-v4.1-flash");
+      expect(h.thinkingLevel()).toBe("low");
+      await settle(h);
+      expect(h.thinkingLevel()).toBe("high");
+    });
+
+    it("keeps the caller's model when a price is missing from the registry, and says so", async () => {
+      const h = await start();
+      delete h.registry.get("openrouter/z-ai/glm-5.3").cost;
+      await h.prompt("coordinate the study");
+      await h.loadSkill("coordinator");
+      await h.loadSkill("step-skill");
+      expect(h.getModel().id).toBe("z-ai/glm-5.3");
+      expect(h.notifications).toContainEqual(
+        expect.stringContaining(
+          'tier "small" not applied: cannot tell it is cheaper than openrouter/z-ai/glm-5.3 (no price in the model registry)',
+        ),
+      );
+    });
+
+    it("falls back to allow-downgrade for an unknown policy name", async () => {
+      const h = await start({ models: { ...CONFIG.models, helperTierPolicy: "sometimes" } });
+      await h.prompt("coordinate the study");
+      await h.loadSkill("coordinator");
+      await h.loadSkill("step-skill");
+      expect(h.getModel().id).toBe("qwen/qwen3.7-flash");
+    });
+
+    it("shows the helper policy in /skills-model", async () => {
+      const h = await start();
+      await h.commands.get("skills-model").handler("", h.ctx);
+      expect(h.notifications.at(-1)).toContain(
+        "helpers  allow-downgrade (a helper of a working caller switches only to a cheaper model, for the run)",
+      );
+    });
+  });
+
+  it("lets a helper upgrade the caller's model for the run with helperTierPolicy always", async () => {
+    const h = await start({ models: { ...CONFIG.models, helperTierPolicy: "always" } });
+    await h.prompt("explore the data");
+    await h.loadSkill("explore-ml-data"); // medium, session
+    await h.loadSkill("big-helper"); // big: applied, upgrade included
+    expect(h.getModel().id).toBe("z-ai/glm-5.3");
+    await h.emit("agent_settled", { type: "agent_settled" });
+    expect(h.getModel().id).toBe("deepseek/deepseek-v4.1-flash");
+  });
 
   it("records each model switch on the session and draws it in the chat", async () => {
     const h = await start();
@@ -1302,7 +1443,7 @@ describe("model tiers: robustness", () => {
   });
 
   it("records nothing when the model does not change", async () => {
-    const h = await start();
+    const h = await start(KEEP);
     h.failSetModel.add("openrouter/z-ai/glm-5.3");
     await h.prompt("coordinate the study");
     await h.loadSkill("big-skill"); // the switch fails

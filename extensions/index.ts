@@ -18,7 +18,9 @@
  *   (`metadata.role`), the config, or inference.
  * - A skill can name a model tier (`metadata.modelTier`); the `models` config
  *   maps tiers to models already registered in Pi, and the extension switches
- *   with `pi.setModel()` — no new provider or API key is ever needed.
+ *   with `pi.setModel()` — no new provider or API key is ever needed. A
+ *   helper loaded by a working caller switches only to a cheaper model by
+ *   default (`models.helperTierPolicy`), for the rest of the run.
  *
  * Commands: /skills-pin, /skills-unpin, /skills-list, /skills-explain,
  *           /skills-reload, /skills-on, /skills-off, /skills-model
@@ -34,6 +36,7 @@ import { Type } from "typebox";
 import { buildSkillIndex, decideRelevance, type IndexableSkill, type SkillIndex } from "./relevance.ts";
 import type { EngineConfig, Roles } from "./rules.ts";
 import {
+  compareModelCost,
   describeModelEvent,
   MODEL_EVENT_TYPE,
   modelSettingsFrom,
@@ -209,6 +212,13 @@ export default function (pi: ExtensionAPI) {
   let runSnapshot: ModelSnapshot | undefined;
   /** Name of the run-scoped tier now in effect, for the chat record of its restore. */
   let runTier: string | undefined;
+  /**
+   * The caller's model when helpers have switched it during this run: the
+   * ceiling a helper may switch to. Comparing with it, not with the model a
+   * previous helper left, lets a medium helper follow a small one. Cleared by
+   * any non-helper switch, a user's pick, a reset, and at the end of the run.
+   */
+  let helperCeiling: ModelSnapshot | undefined;
   /** Tail of the model-switch queue: switches apply one at a time, in call order. */
   let modelQueue: Promise<void> = Promise.resolve();
   /** Model-tier warnings already shown this session (a misconfiguration repeats on every load). */
@@ -339,11 +349,11 @@ export default function (pi: ExtensionAPI) {
   }
 
   /**
-   * Whether loading `name` must leave the model alone because the skill that
-   * loaded it keeps working: `role: helper` means the caller continues after
-   * the helper, so the helper's tier must not downgrade (or upgrade) the
-   * caller's model for the rest of its work. A helper loaded with nothing but
-   * the entry skill around is the task itself and applies its own tier.
+   * Whether `name` is a helper loaded while the skill that loaded it keeps
+   * working: `role: helper` means the caller continues after the helper. Such
+   * a load follows `models.helperTierPolicy` instead of switching freely. A
+   * helper loaded with nothing but the entry skill around is the task itself
+   * and applies its own tier.
    */
   function loadedByWorkingCaller(name: string): boolean {
     if (!roles.helpers.has(name)) return false;
@@ -358,16 +368,66 @@ export default function (pi: ExtensionAPI) {
     );
   }
 
-  /** A helper kept its caller's model: say so when its own tier would have switched. */
-  function noteKeptModel(name: string, metadata: Record<string, unknown> | undefined, ctx: ExtensionContext) {
+  /** A helper kept its caller's model: say so, and why, when its own tier would have switched. */
+  function noteKeptModel(
+    name: string,
+    metadata: Record<string, unknown> | undefined,
+    ctx: ExtensionContext,
+    reason?: string,
+  ) {
     if (!modelSettings.enabled) return;
     const decision = resolveSkillModel(name, metadata, modelSettings);
     const target = decision.ref && ctx.modelRegistry.find(decision.ref.provider, decision.ref.model);
     const current = describeModel(ctx.model);
     modelOutcomes.set(name, `kept ${current} (helper of a working caller)`);
     if (decision.action !== "switch" || !target || describeModel(target) === current) return;
-    modelOutcomes.set(name, `kept ${current} (helper of a working caller; tier "${decision.tier}" not applied)`);
-    info(ctx, `🎚️ skill("${name}") keeps ${current}: helper loaded by a working caller (tier "${decision.tier}" not applied)`);
+    const why = `tier "${decision.tier}" not applied${reason ? `: ${reason}` : ""}`;
+    modelOutcomes.set(name, `kept ${current} (helper of a working caller; ${why})`);
+    info(ctx, `🎚️ skill("${name}") keeps ${current}: helper loaded by a working caller (${why})`);
+  }
+
+  /**
+   * A helper loaded while its caller keeps working. `keep` leaves the caller's
+   * model; `allow-downgrade` applies the helper's tier only when it is cheaper
+   * than the model in use now; `always` applies it. Decided inside the switch
+   * queue, so the comparison sees the model left by earlier switches.
+   */
+  async function applyHelperModel(
+    name: string,
+    metadata: Record<string, unknown> | undefined,
+    ctx: ExtensionContext,
+  ): Promise<void> {
+    if (!modelSettings.enabled) return;
+    const policy = modelSettings.helperTierPolicy;
+    if (policy === "keep") return noteKeptModel(name, metadata, ctx);
+
+    const decision = resolveSkillModel(name, metadata, modelSettings);
+    const ref = decision.ref;
+    const target = ref && ctx.modelRegistry.find(ref.provider, ref.model);
+    if (decision.action !== "switch" || !ref || !target) return noteKeptModel(name, metadata, ctx);
+    if (policy === "always") return applySkillModel(name, metadata, ctx, `skill("${name}")`, { helper: true });
+
+    // allow-downgrade: compare with the caller's model, not with the model an
+    // earlier helper of the same caller switched to.
+    const ceiling = helperCeiling ?? (ctx.model ? snapshot(ctx.model, pi.getThinkingLevel()) : undefined);
+    const ceilingModel = ceiling && ctx.modelRegistry.find(ceiling.provider, ceiling.id);
+    const backToCaller =
+      ceiling !== undefined &&
+      ceiling.provider === target.provider &&
+      ceiling.id === target.id &&
+      (ref.thinkingLevel === undefined || ref.thinkingLevel === ceiling.thinkingLevel);
+    const cost = compareModelCost(ceilingModel, ceiling?.thinkingLevel, target, ref.thinkingLevel);
+    if (cost === "cheaper" || backToCaller) {
+      return applySkillModel(name, metadata, ctx, `skill("${name}")`, { helper: true });
+    }
+    noteKeptModel(
+      name,
+      metadata,
+      ctx,
+      cost === "unknown"
+        ? `cannot tell it is cheaper than ${describeModel(ceiling)} (no price in the model registry)`
+        : `not cheaper than the caller's ${describeModel(ceiling)}`,
+    );
   }
 
   /** `pi.setModel`, marked as ours so the `model_select` it emits is not taken for the user's choice. */
@@ -410,6 +470,7 @@ export default function (pi: ExtensionAPI) {
     metadata: Record<string, unknown> | undefined,
     ctx: ExtensionContext,
     trigger: string,
+    options: { helper?: boolean } = {},
   ): Promise<void> {
     if (!modelSettings.enabled) return;
 
@@ -458,14 +519,20 @@ export default function (pi: ExtensionAPI) {
     if (before) modelSnapshot ??= before;
     // A run-scoped tier remembers the model just before it (the first one, if
     // several run-scoped tiers follow); a session-scoped switch supersedes it.
-    if (ref.scope === "run") {
+    // A helper's switch is run-scoped whatever its tier says: its caller keeps
+    // working afterwards and gets its model back when the run settles.
+    const scope = options.helper ? "run" : (ref.scope ?? "session");
+    if (options.helper) helperCeiling ??= before;
+    else helperCeiling = undefined;
+    if (scope === "run") {
       runSnapshot ??= before;
       runTier = decision.tier;
     } else {
       runSnapshot = undefined;
       runTier = undefined;
     }
-    modelOutcomes.set(name, `switched to ${describeModel(model)} (tier "${decision.tier}")`);
+    const helperNote = options.helper ? ", helper of a working caller, this run only" : "";
+    modelOutcomes.set(name, `switched to ${describeModel(model)} (tier "${decision.tier}"${helperNote})`);
     recordModelEvent({
       event: "switch",
       from: before && describeModel(before),
@@ -474,11 +541,12 @@ export default function (pi: ExtensionAPI) {
       trigger,
       tier: decision.tier,
       source: decision.source,
-      scope: ref.scope ?? "session",
+      scope,
+      ...(options.helper ? { helper: true } : {}),
     });
     info(
       ctx,
-      `🎚️ ${trigger} → ${describeModel(model)} (tier "${decision.tier}", ${decision.source ?? "config"})${ref.scope === "run" ? " for this run" : ""}`,
+      `🎚️ ${trigger} → ${describeModel(model)} (tier "${decision.tier}", ${decision.source ?? "config"}${options.helper ? ", helper" : ""})${scope === "run" ? " for this run" : ""}`,
     );
     if (decision.problem) warnOnce(ctx, decision.problem);
   }
@@ -534,6 +602,7 @@ export default function (pi: ExtensionAPI) {
     modelSnapshot = undefined;
     runSnapshot = undefined;
     runTier = undefined;
+    helperCeiling = undefined;
     modelWarnings.clear();
     modelOutcomes.clear();
     batch.clear();
@@ -688,6 +757,7 @@ export default function (pi: ExtensionAPI) {
     if (!ownModelSwitch && event.source !== "restore") {
       runSnapshot = undefined;
       runTier = undefined;
+      helperCeiling = undefined;
     }
   });
 
@@ -696,6 +766,7 @@ export default function (pi: ExtensionAPI) {
     const tier = runTier;
     runSnapshot = undefined;
     runTier = undefined;
+    helperCeiling = undefined;
     if (!target) return;
     await queueModelSwitch(async () => {
       const from = describeModel(ctx.model);
@@ -737,9 +808,9 @@ export default function (pi: ExtensionAPI) {
 
       // Reserve the model switch before any await, so skills loaded in parallel
       // by one assistant message switch in call order, and decide from the
-      // state before this load whether a working caller keeps its model.
+      // state before this load whether a caller keeps working after it.
       const file = readFile(skill.filePath, "utf-8");
-      const keepModel = loadedByWorkingCaller(skill.name);
+      const workingCaller = loadedByWorkingCaller(skill.name);
       const switched = queueModelSwitch(async () => {
         let text: string;
         try {
@@ -748,7 +819,7 @@ export default function (pi: ExtensionAPI) {
           return; // the load itself fails and reports it
         }
         const metadata = parseMetadata(text);
-        if (keepModel) noteKeptModel(skill.name, metadata, ctx);
+        if (workingCaller) await applyHelperModel(skill.name, metadata, ctx);
         else await applySkillModel(skill.name, metadata, ctx, `skill("${skill.name}")`);
       }).catch((err: any) => warn(ctx, `model tier switch failed: ${err?.message ?? err}`));
       const raw = await file;
@@ -904,6 +975,7 @@ export default function (pi: ExtensionAPI) {
         modelSnapshot = undefined;
         runSnapshot = undefined;
         runTier = undefined;
+        helperCeiling = undefined;
         let ok = false;
         await queueModelSwitch(async () => {
           const from = describeModel(ctx.model);
@@ -940,6 +1012,12 @@ export default function (pi: ExtensionAPI) {
             : `${modelSettings.default.provider}/${modelSettings.default.model}`;
         lines.push(`  default  ${shown}${modelSettings.applyToUnlabeledSkills ? "" : " (only for unknown tier names)"}`);
       }
+      const helperPolicy = {
+        keep: "keep (a helper of a working caller keeps its model)",
+        "allow-downgrade": "allow-downgrade (a helper of a working caller switches only to a cheaper model, for the run)",
+        always: "always (a helper of a working caller applies its tier, for the run)",
+      }[modelSettings.helperTierPolicy];
+      lines.push(`  helpers  ${helperPolicy}`);
       const overrides = Object.entries(modelSettings.skillTiers).sort();
       if (overrides.length > 0) lines.push(`  overrides: ${overrides.map(([n, t]) => `${n}→${t}`).join(", ")}`);
       if (loaded.size > 0) {

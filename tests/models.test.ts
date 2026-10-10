@@ -5,9 +5,12 @@
 
 import { describe, it, expect } from "vitest";
 import {
+  compareModelCost,
   DEFAULT_MODEL_CONFIG,
   describeModelEvent,
   frontmatterTier,
+  isCheaperModel,
+  modelPrice,
   modelSettingsFrom,
   normalizeTier,
   resolveSkillModel,
@@ -32,6 +35,14 @@ describe("modelSettingsFrom", () => {
     expect(DEFAULT_MODEL_CONFIG.tiers).toEqual({});
     expect(DEFAULT_MODEL_CONFIG.default).toBeNull();
     expect(DEFAULT_MODEL_CONFIG.enabled).toBe(true);
+    expect(DEFAULT_MODEL_CONFIG.helperTierPolicy).toBe("allow-downgrade");
+  });
+
+  it("reads helperTierPolicy, case-insensitively, and ignores unknown values", () => {
+    expect(settings({ helperTierPolicy: "keep" }).helperTierPolicy).toBe("keep");
+    expect(settings({ helperTierPolicy: " Always " as any }).helperTierPolicy).toBe("always");
+    expect(settings({ helperTierPolicy: "sometimes" as any }).helperTierPolicy).toBe("allow-downgrade");
+    expect(settings({ helperTierPolicy: 3 as any }).helperTierPolicy).toBe("allow-downgrade");
   });
 
   it("keeps provider, model, thinking level, and scope of a tier", () => {
@@ -210,6 +221,12 @@ describe("describeModelEvent", () => {
     expect(describeModelEvent({ ...SWITCH, scope: "session" })).not.toContain("this run only");
   });
 
+  it("says when a helper switched the model while its caller keeps working", () => {
+    expect(describeModelEvent({ ...SWITCH, helper: true })).toBe(
+      '🎚️ Model openrouter/z-ai/glm-5.3 (thinking max) · tier "big" for skill("build-ml-pipeline") (helper of a working caller), this run only',
+    );
+  });
+
   it("adds where the model came from when expanded", () => {
     expect(describeModelEvent(SWITCH, true)).toBe(`${LINE}\n   was openrouter/moonshotai/kimi-k2.6 · tier from frontmatter`);
   });
@@ -223,3 +240,39 @@ describe("describeModelEvent", () => {
     );
   });
 });
+
+describe("model price comparison", () => {
+  const flash = { provider: "openrouter", id: "deepseek/deepseek-v4.1-flash", cost: { input: 0.3, output: 1.2 } };
+  const max = { provider: "openrouter", id: "qwen/qwen3.8-max-0902", cost: { input: 2, output: 6 } };
+  const unpriced = { provider: "openrouter", id: "some/model" };
+
+  it("prices a model as input plus output per million tokens", () => {
+    expect(modelPrice(flash)).toBeCloseTo(1.5);
+    expect(modelPrice(unpriced)).toBeUndefined();
+    expect(modelPrice({ ...flash, cost: { input: 0.3 } })).toBeUndefined();
+    expect(modelPrice({ ...flash, cost: { input: -1, output: 1 } })).toBeUndefined();
+    expect(modelPrice({ ...flash, cost: { input: Number.NaN, output: 1 } })).toBeUndefined();
+  });
+
+  it("is cheaper only on a strictly lower price", () => {
+    expect(compareModelCost(max, "xhigh", flash, "high")).toBe("cheaper");
+    expect(compareModelCost(flash, "high", max, "xhigh")).toBe("not-cheaper");
+    expect(compareModelCost(flash, "high", { ...max, cost: flash.cost }, "high")).toBe("not-cheaper");
+  });
+
+  it("compares thinking levels on the same model", () => {
+    expect(compareModelCost(flash, "high", flash, "low")).toBe("cheaper");
+    expect(compareModelCost(flash, "low", flash, "high")).toBe("not-cheaper");
+    expect(compareModelCost(flash, "high", flash, "high")).toBe("not-cheaper");
+    expect(compareModelCost(flash, "high", flash, undefined)).toBe("unknown");
+  });
+
+  it("cannot tell without a price or a model, and then is not cheaper", () => {
+    expect(compareModelCost(unpriced, "high", flash, "low")).toBe("unknown");
+    expect(compareModelCost(max, "high", unpriced, "low")).toBe("unknown");
+    expect(compareModelCost(undefined, "high", flash, "low")).toBe("unknown");
+    expect(isCheaperModel(unpriced, "high", flash, "low")).toBe(false);
+    expect(isCheaperModel(max, "xhigh", flash, "high")).toBe(true);
+  });
+});
+
